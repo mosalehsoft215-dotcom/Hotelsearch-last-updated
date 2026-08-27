@@ -1,0 +1,614 @@
+from __future__ import annotations
+
+"""Per-session agent state: memory, the tool calls made, and a verify result."""
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+class SessionMemory:
+    def __init__(self) -> None:
+        self._data: dict[str, Any] = {}
+
+    def remember(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
+    def recall(self, key: str) -> Any:
+        return self._data.get(key)
+
+    def recall_all(self) -> dict[str, Any]:
+        return dict(self._data)
+
+
+@dataclass
+class ToolCall:
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+    result: Any = None
+
+
+@dataclass
+class AgentContext:
+    org_id: str
+    currency: str = "USD"
+    nationality: str = "AE"
+    username: str | None = None
+    memory: Any | None = None          # GraphitiMemory — durable, cross-session
+    memory_context: str | None = None  # facts pulled at session start
+    brief: str | None = None           # set when another agent delegated this work
+    parent: "AgentContext | None" = field(default=None, repr=False)
+    session: SessionMemory = field(default_factory=SessionMemory)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    def remember(self, key: str, value: Any) -> None:
+        self.session.remember(key, value)
+
+    def recall(self, key: str) -> Any:
+        return self.session.recall(key)
+
+    def recall_all(self) -> dict[str, Any]:
+        return self.session.recall_all()
+
+    def for_child(self, brief: str) -> "AgentContext":
+        """A context for an agent working on our behalf.
+
+        It gets who the customer is and the durable store, because those belong
+        to the person rather than to the conversation. It does not get our
+        session keys, our tool results or our retrieved facts — a child that can
+        read the parent's scratchpad ends up answering the parent's question
+        instead of its own, and the transcript grows without bound.
+        """
+        return AgentContext(
+            org_id=self.org_id, currency=self.currency, nationality=self.nationality,
+            username=self.username, memory=self.memory, brief=brief, parent=self)
+
+
+class VerificationResult:
+    def __init__(self, passed: bool = True) -> None:
+        self.passed = passed
+        self.issues: list[str] = []
+
+    def add_issue(self, issue: str) -> None:
+        self.passed = False
+        self.issues.append(issue)
+
+
+"""OpenRouter chat-completions client (OpenAI-compatible, with function calling).
+
+The agent loop only needs `complete(messages, tools) -> LLMResponse`. Tool calls
+come back normalised so the loop never touches provider-specific JSON.
+"""
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+
+from config import Settings, get_settings
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+@dataclass
+class LLMToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class LLMResponse:
+    content: str | None = None
+    tool_calls: list[LLMToolCall] = field(default_factory=list)
+
+
+class OpenRouterLLM:
+    def __init__(self, *, api_key: str | None, model: str,
+                 base_url: str = "https://openrouter.ai/api/v1",
+                 max_tokens: int | None = None,
+                 timeout: float = 60.0, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        if not api_key:
+            raise LLMError("OPENROUTER_API_KEY is not set")
+        self._api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
+        self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def complete(self, messages: list[dict[str, Any]],
+                       tools: list[dict[str, Any]] | None = None) -> LLMResponse:
+        base: dict[str, Any] = {"model": self.model, "messages": messages}
+        if tools:
+            base["tools"] = tools
+            base["tool_choice"] = "auto"
+
+        # One retry: OpenRouter returns 402 with "can only afford N tokens" when the
+        # request's max_tokens exceeds the caller's credit balance. Parse N and retry
+        # with that budget so the session self-heals as credits drain.
+        tried_other_spelling = False
+        for attempt in range(3):
+            body = dict(base)
+            body["model"] = self.model
+            if self.max_tokens:
+                body["max_tokens"] = self.max_tokens
+            try:
+                resp = await self._client.post(
+                    f"{self.base_url}/chat/completions", json=body,
+                    headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                )
+            except httpx.HTTPError as exc:
+                raise LLMError(f"OpenRouter request failed: {exc}") from exc
+
+            if resp.status_code == 402 and attempt == 0:
+                afford = re.search(r"can only afford (\d+)", resp.text)
+                if afford:
+                    self.max_tokens = max(256, int(afford.group(1)) - 64)
+                    continue
+
+            # A name that is listed with :free on one account and without it on
+            # another comes back as "no such model". Try the other spelling once.
+            if (resp.status_code in (400, 404) and not tried_other_spelling
+                    and re.search(r"model", resp.text, re.I)):
+                tried_other_spelling = True
+                self.model = free_variant(self.model)
+                continue
+
+            if resp.status_code >= 400:
+                raise LLMError(f"OpenRouter HTTP {resp.status_code}: {resp.text[:500]}")
+            break
+
+        data = resp.json()
+        if data.get("error"):
+            raise LLMError(str(data["error"]))
+
+        choices = data.get("choices") or []
+        if not choices:
+            raise LLMError(f"OpenRouter returned no choices: {str(data)[:300]}")
+        message = choices[0].get("message") or {}
+
+        calls: list[LLMToolCall] = []
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            raw = fn.get("arguments") or "{}"
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except json.JSONDecodeError as exc:
+                raise LLMError(f"tool call arguments were not valid JSON: {exc.msg}") from exc
+            calls.append(LLMToolCall(id=tc.get("id") or fn.get("name", ""), name=fn.get("name", ""), arguments=args))
+
+        return LLMResponse(content=message.get("content"), tool_calls=calls)
+
+
+def free_variant(model: str) -> str:
+    """Some models are listed with a :free suffix and some without, and which one
+    an account can reach differs. Give the other spelling of the same name."""
+    return model[:-5] if model.endswith(":free") else model + ":free"
+
+
+def build_llm(settings: Settings | None = None, model: str | None = None) -> OpenRouterLLM:
+    s = settings or get_settings()
+    if s.llm_provider != "openrouter":
+        raise LLMError(f"unsupported LLM_PROVIDER {s.llm_provider!r}; only 'openrouter' is implemented")
+    chosen, api_key = s.credentials_for(model)
+    return OpenRouterLLM(api_key=api_key, model=chosen,
+                         base_url=s.openrouter_base_url, max_tokens=s.openrouter_max_tokens)
+
+
+"""The hotel tools an agent may call. Read and draft only: search, reprice, and
+read bookings. Booking and cancel are intentionally not here — they can't be
+called because they don't exist in this map.
+
+organizationId / currency / nationality are injected from the agent context, so
+the model neither sees nor sets them (it never learns the org id).
+"""
+
+import inspect
+from typing import Any
+
+from pydantic import BaseModel
+
+import hotel_tools as hotels
+import memory_tools
+import web_tools
+import ops_tools as ops
+
+_IMPL = {
+    "resolve_destination": hotels.resolve_destination,
+    "search_hotel_availability": hotels.search_hotel_availability,
+    "refresh_hotel_price": hotels.refresh_hotel_price,
+    "list_hotel_bookings": hotels.list_hotel_bookings,
+    "get_hotel_booking": hotels.get_hotel_booking,
+    "get_hotel_search_results": hotels.get_hotel_search_results,
+    "poll_hotel_booking": hotels.poll_hotel_booking,
+    "get_hotel_static_data": hotels.get_hotel_static_data,
+    "get_hotel_availability_options": hotels.get_hotel_availability_options,
+    "get_hotel_options": hotels.get_hotel_options,
+    "remember_preference": memory_tools.remember_preference,
+    "recall_preferences": memory_tools.recall_preferences,
+    "record_ops_pattern": memory_tools.record_ops_pattern,
+    "enrich_hotel_info": web_tools.enrich_hotel_info,
+    "enrich_destination": web_tools.enrich_destination,
+    "search_enrichment": web_tools.search_enrichment,
+}
+
+TOOL_SPECS: list[dict[str, Any]] = [
+    {"type": "function", "function": {
+        "name": "resolve_destination",
+        "description": "Turn a city or hotel name into destination code(s). Prefer CITY results; use to disambiguate.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "City or hotel name"},
+            "limit": {"type": "integer", "default": 10},
+        }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "search_hotel_availability",
+        "description": "Search hotels for a city and date range. Returns sorted, filtered, priced hotels plus destination alternatives and paging info.",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string"},
+            "checkIn": {"type": "string", "description": "YYYY-MM-DD"},
+            "checkOut": {"type": "string", "description": "YYYY-MM-DD"},
+            "adults": {"type": "integer", "default": 2},
+            "childrenAges": {"type": "array", "items": {"type": "integer"}},
+            "roomCount": {"type": "integer", "default": 1},
+            "destinationCode": {"type": "string", "description": "Force a specific destination code (from resolve_destination) to skip name matching."},
+            "sortField": {"type": "string", "enum": ["PRICE", "RATING", "RECOMMENDED"], "default": "PRICE",
+                          "description": "RATING is the star rating. There is no STARS value."},
+            "sortOrder": {"type": "string", "enum": ["asc", "desc"], "default": "asc"},
+            "minPrice": {"type": "number", "description": "Lowest total price to include."},
+            "maxPrice": {"type": "number", "description": "Highest total price to include."},
+            "minStars": {"type": "integer", "description": "Lowest star rating to include."},
+            "maxStars": {"type": "integer", "description": "Highest star rating to include."},
+            "amenities": {"type": "array", "items": {"type": "string"},
+                          "description": "Only hotels having all of these, e.g. [\"wifi\", \"pool\"]."},
+            "pageNumber": {"type": "integer", "default": 0},
+            "limit": {"type": "integer", "default": 5, "description": "How many hotels to return."},
+        }, "required": ["city", "checkIn", "checkOut"]}}},
+    {"type": "function", "function": {
+        "name": "get_hotel_search_results",
+        "description": "Read a page of an existing search by its uuid — to let prices finish loading, to re-sort or re-filter, or to page. Does not start a new search.",
+        "parameters": {"type": "object", "properties": {
+            "uuid": {"type": "string"},
+            "sortField": {"type": "string", "enum": ["PRICE", "RATING", "RECOMMENDED"], "default": "PRICE",
+                          "description": "RATING is the star rating. There is no STARS value."},
+            "sortOrder": {"type": "string", "enum": ["asc", "desc"], "default": "asc"},
+            "minPrice": {"type": "number", "description": "Lowest total price to include."},
+            "maxPrice": {"type": "number", "description": "Highest total price to include."},
+            "minStars": {"type": "integer", "description": "Lowest star rating to include."},
+            "maxStars": {"type": "integer", "description": "Highest star rating to include."},
+            "amenities": {"type": "array", "items": {"type": "string"},
+                          "description": "Only hotels having all of these, e.g. [\"wifi\", \"pool\"]."},
+            "pageNumber": {"type": "integer", "default": 0},
+            "pageSize": {"type": "integer", "default": 20},
+        }, "required": ["uuid"]}}},
+    {"type": "function", "function": {
+        "name": "get_hotel_static_data",
+        "description": "Content for one hotel: name, address, star rating, media, phones. Use after the user picks a hotel from the results.",
+        "parameters": {"type": "object", "properties": {
+            "hotelCode": {"type": "string"},
+            "extras": {"type": "array", "items": {"type": "string", "enum": ["descriptions", "facilities"]},
+                       "description": "facilities are the hotel amenities."},
+        }, "required": ["hotelCode"]}}},
+    {"type": "function", "function": {
+        "name": "get_hotel_availability_options",
+        "description": "Room options for one hotel inside a running search (needs the search uuid): board/meal plan, price, cancellation policy. Filter by refundableOnly, mealPlan, price.",
+        "parameters": {"type": "object", "properties": {
+            "uuid": {"type": "string", "description": "The search uuid."},
+            "hotelCode": {"type": "string"},
+            "refundableOnly": {"type": "boolean", "default": False},
+            "mealPlan": {"type": "array", "items": {"type": "string"},
+                         "description": "Match board text/code, e.g. [\"breakfast\"]."},
+            "minPrice": {"type": "number"},
+            "maxPrice": {"type": "number"},
+        }, "required": ["uuid", "hotelCode"]}}},
+    {"type": "function", "function": {
+        "name": "get_hotel_options",
+        "description": "Priced room options for one hotel with an optionRefId to reprice and book. Use when the search uuid has expired.",
+        "parameters": {"type": "object", "properties": {
+            "hotelCode": {"type": "string"},
+            "checkIn": {"type": "string", "description": "YYYY-MM-DD"},
+            "checkOut": {"type": "string", "description": "YYYY-MM-DD"},
+            "adults": {"type": "integer", "default": 2},
+            "childrenAges": {"type": "array", "items": {"type": "integer"}},
+            "roomCount": {"type": "integer", "default": 1},
+            "refundableOnly": {"type": "boolean", "default": False},
+            "minPrice": {"type": "number"},
+            "maxPrice": {"type": "number"},
+        }, "required": ["hotelCode", "checkIn", "checkOut"]}}},
+    {"type": "function", "function": {
+        "name": "refresh_hotel_price",
+        "description": "Confirm the live rate for a selected room before quoting it. Does not book.",
+        "parameters": {"type": "object", "properties": {
+            "optionRefId": {"type": "string"},
+            "applyMarkup": {"type": "boolean", "default": False},
+        }, "required": ["optionRefId"]}}},
+    {"type": "function", "function": {
+        "name": "list_hotel_bookings",
+        "description": "List existing hotel bookings for the organization, newest first.",
+        "parameters": {"type": "object", "properties": {
+            "bookingStatus": {"type": "string"},
+            "customerId": {"type": "string"},
+            "limit": {"type": "integer", "default": 50},
+        }}}},
+    {"type": "function", "function": {
+        "name": "get_hotel_booking",
+        "description": "Get one hotel booking by its numeric Id.",
+        "parameters": {"type": "object", "properties": {
+            "Id": {"type": "integer"},
+        }, "required": ["Id"]}}},
+    {"type": "function", "function": {
+        "name": "poll_hotel_booking",
+        "description": "Check a booking's status by its HotelBookingId string.",
+        "parameters": {"type": "object", "properties": {
+            "hotelBookingId": {"type": "string"},
+        }, "required": ["hotelBookingId"]}}},
+]
+
+AVAILABLE_TOOL_NAMES = frozenset(_IMPL)
+
+# --- ops / booking-queue tools (used by the ops triage agent) ---
+_IMPL.update({
+    "get_queue_summary": ops.get_queue_summary,
+    "get_failed_messages": ops.get_failed_messages,
+    "get_message_detail": ops.get_message_detail,
+    "get_transaction": ops.get_transaction,
+    "list_transactions": ops.list_transactions,
+    "run_named_query": ops.run_named_query,
+})
+TOOL_SPECS.extend([
+    {"type": "function", "function": {
+        "name": "enrich_hotel_info",
+        "description": "What the web says about one hotel: reputation, location, facilities, and risks such as renovation or closure. Every claim carries its sources and whether they agree. Never a source of price, availability or cancellation terms.",
+        "parameters": {"type": "object", "properties": {
+            "hotelName": {"type": "string"},
+            "city": {"type": "string"},
+            "domains": {"type": "array", "items": {"type": "string",
+                        "enum": ["reputation", "location", "facilities", "risk"]}},
+            "officialSite": {"type": "string", "description": "Hotel's own domain, so its pages outrank aggregators."},
+        }, "required": ["hotelName"]}}},
+    {"type": "function", "function": {
+        "name": "enrich_destination",
+        "description": "Conditions at the destination for the stay: weather for the dates, current travel advice, and recent news. Weather comes from a forecast API, not from prose.",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string"},
+            "checkIn": {"type": "string", "description": "YYYY-MM-DD"},
+            "checkOut": {"type": "string", "description": "YYYY-MM-DD"},
+            "domains": {"type": "array", "items": {"type": "string",
+                        "enum": ["weather", "advisory", "news"]}},
+        }, "required": ["city"]}}},
+    {"type": "function", "function": {
+        "name": "search_enrichment",
+        "description": "Ask in plain words across everything already fetched about hotels and destinations, without knowing the subject or domain first. Use it before fetching again — it costs nothing and may already hold the answer.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string"},
+            "entityType": {"type": "string", "enum": ["hotel", "city"]},
+            "entityRef": {"type": "string", "description": "The hotel or city name."},
+            "subject": {"type": "string", "description": "Loose match on the subject line."},
+            "domain": {"type": "string", "enum": ["reputation", "location", "facilities",
+                       "risk", "weather", "advisory", "news"]},
+            "limit": {"type": "integer", "default": 5},
+        }, "required": ["question"]}}},
+    {"type": "function", "function": {
+        "name": "remember_preference",
+        "description": "Store something the user stated about how they like to travel or book, so it is still known in future sessions. Only call this when the user states a preference — never for search results or supplier data.",
+        "parameters": {"type": "object", "properties": {
+            "statement": {"type": "string", "description": "The preference in the user's own words."},
+            "key": {"type": "string", "description": "What the preference is about, e.g. hotel_stars, board, city. A new value for the same key supersedes the old one."},
+        }, "required": ["statement"]}}},
+    {"type": "function", "function": {
+        "name": "recall_preferences",
+        "description": "Look up what is already known about this user and organization for a topic.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+        }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "record_ops_pattern",
+        "description": "Record a dead-letter error signature, and report whether it was already known from an earlier session.",
+        "parameters": {"type": "object", "properties": {
+            "signature": {"type": "string", "description": "The error signature, e.g. operation:classification."},
+        }, "required": ["signature"]}}},
+    {"type": "function", "function": {
+        "name": "get_queue_summary",
+        "description": "Count booking-queue messages by status (pending, processing, complete, failed).",
+        "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 1000}}}}},
+    {"type": "function", "function": {
+        "name": "get_failed_messages",
+        "description": "List dead-letter (failed) queue messages, newest first.",
+        "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}}}},
+    {"type": "function", "function": {
+        "name": "get_message_detail",
+        "description": "Full detail for one queue message including the error trace.",
+        "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]}}},
+    {"type": "function", "function": {
+        "name": "get_transaction",
+        "description": "Load the transaction linked to a message, by its TransactionGuid.",
+        "parameters": {"type": "object", "properties": {
+            "guid": {"type": "string"},
+            "fields": {"type": "array", "items": {"type": "string"}}}, "required": ["guid"]}}},
+    {"type": "function", "function": {
+        "name": "list_transactions",
+        "description": "Transactions for the organization in a time window (org scope enforced).",
+        "parameters": {"type": "object", "properties": {
+            "where": {"type": "object"}, "limit": {"type": "integer", "default": 50}}}}},
+    {"type": "function", "function": {
+        "name": "run_named_query",
+        "description": "Run a named query. 'triage_context' returns a failed message plus its linked transaction.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "variables": {"type": "object"}}, "required": ["name"]}}},
+])
+AVAILABLE_TOOL_NAMES = frozenset(_IMPL)
+
+
+def specs_for(names: frozenset[str] | set[str]) -> list[dict[str, Any]]:
+    return [s for s in TOOL_SPECS if s["function"]["name"] in names]
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+async def dispatch(name: str, args: dict[str, Any] | None, ctx: AgentContext) -> Any:
+    if name not in _IMPL:
+        raise KeyError(f"tool {name!r} is not available to this agent")
+    fn = _IMPL[name]
+    params = inspect.signature(fn).parameters
+    call_args = dict(args or {})
+    if "organizationId" in params:
+        call_args.setdefault("organizationId", ctx.org_id)
+    if "currency" in params:
+        call_args.setdefault("currency", ctx.currency)
+    if "nationality" in params:
+        call_args.setdefault("nationality", ctx.nationality)
+    if "ctx" in params:
+        call_args["ctx"] = ctx
+    return _jsonable(await fn(**call_args))
+
+
+"""Agent runtime: build a system prompt, run the LLM tool-calling loop against
+the allowed tools, then verify. Providers and tools are injected, so subclasses
+only declare role, prompt, tool set, and checks.
+"""
+
+import json
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any
+
+
+
+@dataclass
+class Handover:
+    """What comes back from an agent that worked on another one's behalf. The
+    answer and how it was reached — not the messages, not the tool payloads."""
+    agent: str
+    answer: str
+    tools_used: list[str]
+    passed: bool
+    issues: list[str] = field(default_factory=list)
+
+    def to_model(self) -> dict[str, Any]:
+        return {"agent": self.agent, "answer": self.answer,
+                "tools_used": self.tools_used, "verified": self.passed,
+                "issues": self.issues}
+
+
+async def delegate(agent: "AgentBase", brief: str, llm, parent: AgentContext,
+                   max_iterations: int = 6) -> Handover:
+    """Run another agent on its own context and bring back a summary.
+
+    The child builds its own prompt from the brief, keeps its own memory and its
+    own tool calls, and hands back one paragraph. Nothing it read reaches the
+    caller's history.
+    """
+    child = parent.for_child(brief)
+    result = await agent.run(child, brief, llm, max_iterations=max_iterations)
+    return Handover(agent=agent.get_role(), answer=result.output,
+                    tools_used=[c.name for c in child.tool_calls],
+                    passed=result.verification.passed,
+                    issues=list(result.verification.issues))
+
+
+@dataclass
+class AgentRunResult:
+    output: str
+    verification: VerificationResult
+    context: AgentContext
+    messages: list[dict[str, Any]]
+
+
+class AgentBase(ABC):
+    @abstractmethod
+    def get_role(self) -> str: ...
+
+    @abstractmethod
+    def allowed_tools(self) -> frozenset[str]: ...
+
+    @abstractmethod
+    def build_prompt(self, ctx: AgentContext) -> str: ...
+
+    def on_tool_result(self, ctx: AgentContext, call: ToolCall) -> None:
+        """Persist anything worth keeping from a tool result. Default: nothing."""
+
+    def on_run_start(self, ctx: AgentContext) -> None:
+        """Called once at the start of a run. Default: nothing."""
+
+    def on_run_end(self, ctx: AgentContext, output: str) -> None:
+        """Called once after the loop, before verify. Default: nothing."""
+
+    @abstractmethod
+    async def verify(self, ctx: AgentContext) -> VerificationResult: ...
+
+    async def run(self, ctx: AgentContext, user_message: str, llm,
+                  max_iterations: int = 8,
+                  history: list[dict[str, Any]] | None = None) -> AgentRunResult:
+        specs = specs_for(self.allowed_tools())
+        if ctx.memory is not None and ctx.memory_context is None:
+            # one retrieval per session, cached on the context for its lifetime
+            ctx.memory_context = await ctx.memory.get_context(
+                user_message, username=ctx.username, org_id=ctx.org_id)
+        if history:
+            # Continue an existing conversation (multi-turn chat). The system
+            # prompt is already at the front of `history`.
+            messages = list(history)
+            messages.append({"role": "user", "content": user_message})
+        else:
+            system = self.build_prompt(ctx)
+            if ctx.brief is not None:
+                system += ("\n\nAnother agent asked you for this. You cannot see its "
+                           "conversation, so work only from the request above. Answer in "
+                           "one short paragraph it can use directly — findings and what "
+                           "they rest on, no preamble.")
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_message},
+            ]
+        self.on_run_start(ctx)
+        output = None
+        for _ in range(max_iterations):
+            resp = await llm.complete(messages, tools=specs)
+            if not resp.tool_calls:
+                output = resp.content or ""
+                break
+            messages.append({
+                "role": "assistant", "content": resp.content or "",
+                "tool_calls": [{
+                    "id": tc.id, "type": "function",
+                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                } for tc in resp.tool_calls],
+            })
+            for tc in resp.tool_calls:
+                try:
+                    result = await dispatch(tc.name, tc.arguments, ctx)
+                except Exception as exc:  # surface the failure to the model, keep going
+                    result = {"error": f"{type(exc).__name__}: {exc}"}
+                call = ToolCall(name=tc.name, args=tc.arguments, result=result)
+                ctx.tool_calls.append(call)
+                self.on_tool_result(ctx, call)
+                messages.append({
+                    "role": "tool", "tool_call_id": tc.id,
+                    "content": json.dumps(result, default=str),
+                })
+        if output is None:
+            # Hit the tool-call cap without a written answer. Force one from what
+            # was gathered so the user gets a real reply, never a dead end.
+            messages.append({"role": "user", "content":
+                "Give your final answer now using the information you already have. "
+                "Do not call any tools. If no priced hotels were found, say so and "
+                "suggest different dates."})
+            resp = await llm.complete(messages, tools=None)
+            output = resp.content or ("I couldn't get priced availability for that "
+                "search yet — please try again shortly or adjust the dates.")
+            messages.append({"role": "assistant", "content": output})
+        self.on_run_end(ctx, output)
+        verification = await self.verify(ctx)
+        return AgentRunResult(output=output, verification=verification, context=ctx, messages=messages)

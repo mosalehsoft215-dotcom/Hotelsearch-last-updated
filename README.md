@@ -1,93 +1,298 @@
-# yarvel-ai-assistant
+# hotels_mcp — hotel search & ops triage agents
 
+Two read/draft-only agents for the TripOn/Rihla platform, on a shared runtime.
+Neither writes, books, cancels, or replays anything — the tools that would are
+absent from each agent's set, so it's enforced by construction, not by prompting.
 
+- Hotel search — finds hotels and locks a live rate for a quotation.
+- Ops triage — triages failed booking-queue (dead-letter) messages into a report.
 
-## Getting started
+## Layout
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+    config.py            settings, read from .env
+    hasura.py            GraphQL client, response envelope, models, auth token
+    hotel_tools.py       hotel tools: search, filters, hotel detail, reprice, reads
+    web_enrich.py        web context for a hotel: backends, citations, injection guard
+    web_tools.py         the enrich_hotel_info tool
+    ops_tools.py         ops tools: queue summary, failed messages, transactions
+    runtime.py           agent context/memory, OpenRouter client, tool loop, registry
+    agents/
+      hotel_search_agent.py
+      ops_triage_agent.py
+    api.py               web server (serves chat_ui.html, POST /chat)
+    chat_ui.html         two-agent console
+    login.py             loginRihla -> JWT (+ decode user id)
+    healthcheck.py       connection, admin-secret access, JWT login
+    tests/               test_core, test_tools, test_ops, test_agent, test_api, test_live
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Run
 
-## Add your files
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    cp .env.example .env
+    uvicorn api:app --reload      # http://127.0.0.1:8000
+    pytest -q
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+Programmatic:
 
-```
-cd existing_repo
-git remote add origin https://gitlab.tripon.io/tripon/yarvel-ai-assistant.git
-git branch -M main
-git push -uf origin main
-```
+    from agents.hotel_search_agent import answer
+    from agents.ops_triage_agent import answer_triage
+    await answer("Find a hotel for a city and dates", org_id="<org>")
+    await answer_triage("Triage the failed booking queue", org_id="<org>")
 
-## Integrate with your tools
+## Auth
 
-- [ ] [Set up project integrations](https://gitlab.tripon.io/tripon/yarvel-ai-assistant/-/settings/integrations)
+Dev uses the admin secret (`HOTELS_AUTH_MODE=admin_secret`). Production forwards
+the caller's JWT (`forward_jwt`); get one with `python login.py`. `loginRihla`
+needs the admin secret, a `sender-ip` header, and `origin=agency`.
 
-## Collaborate with your team
+## Roles (permissions.json)
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+    hotel_search_agent : bookings, queries, quotations, flights, hotels
+    ops_triage_agent   : bookings, queries, ops
 
-## Test and Deploy
+## Notes
 
-Use the built-in continuous integration in GitLab.
+- Model is set by `OPENROUTER_MODEL` in `.env`.
+- Availability search is async: it polls until hotels are priced and returns only
+  priced ones. When no city matches the query, it reports not-found rather than
+  searching a stray hotel result.
+- Sorting uses `SearchSortOption`: field is `PRICE`, `RATING` or `RECOMMENDED`
+  (`RATING` is the star rating — there is no `STARS` value), order is lowercase
+  `asc`/`desc`. `build_sort()` rejects anything else before the call is made.
+- Filters: `minPrice`/`maxPrice` (total), `minStars`/`maxStars`, and `amenities`
+  (a hotel must have all of them). They apply to the fields a search result
+  carries. `getSearchResults` also takes a server-side `filters` argument, but its
+  input type is not confirmed by the backend yet, so filtering runs in the tool.
+- Cancellation policy and meal plan are not in a search result — they come with
+  the room options, so filter them there: `get_hotel_availability_options`
+  (inside the search session, by `uuid`) or `get_hotel_options` (no session,
+  returns an `optionRefId` to reprice and book) take `refundableOnly`,
+  `mealPlan` and price bounds.
+- `getSearchHotelAvailability` returns `[RoomSearch]`, where each element holds
+  `rooms` and `roomsOptions` side by side. `flatten_room_options()` pairs them
+  into one record per bookable choice (room type + board + price + policy), which
+  is what the tool returns and what the filters run on.
+- `get_hotel_static_data` returns hotel content (name, address, star rating,
+  media, phones). `extras=["descriptions","facilities"]` adds the long text and
+  the amenities; those two inner types are inferred rather than confirmed, which
+  is why they are opt-in.
+- Paging: pass `pageNumber` (and `pageSize` on `get_hotel_search_results`); the
+  result carries `count` and `hasMorePages`.
+- Currency/nationality default to org fallbacks when a request omits them; pass
+  the real values per request since nationality affects supplier pricing.
+- Ops triage classifies each failure (supplier_timeout, validation_error,
+  pnr_conflict, payment_failure, unknown), remembers seen signatures to avoid
+  re-flagging, and tracks run_count per session.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+## Durable memory
 
-***
+`SessionMemory` in `runtime.py` is Layer 1 — per session, gone when the process
+ends. `memory.py` is Layer 2: facts about a user or an organization that outlive
+the session, on a temporal graph.
 
-# Editing this README
+    python demo_memory.py
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Four scenes, no infrastructure needed: a preference recalled in a new session; a
+changed preference where the old fact is closed off rather than deleted; an org
+default overridden by the user on the same key; an ops failure signature
+recognised as recurring on the second session.
 
-## Suggestions for a good README
+Two backends, one interface:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- `local` (default) — in-process graph. Deterministic, used by the demo and the
+  tests. Supersede is driven by an explicit `key`; ranking is lexical with a
+  recency fallback.
+- `graphiti` — `graphiti_core` against FalkorDB, where entity resolution and
+  hybrid search do the same job with an LLM and embeddings.
+  Brought up by `docker compose up --build` (see below).
 
-## Name
-Choose a self-explaining name for your project.
+Capture is explicit. The typed `add_user_episode` / `add_org_episode` /
+`add_booking_episode` / `add_ops_episode` methods are the only way in — there is
+no raw `add_episode()` pass-through, so supplier payloads and tool results cannot
+reach memory on their own. Retrieval runs once per session, at the start, and is
+cached on the agent context.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+### Running it with Docker
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+    docker compose up --build
+    # console: http://localhost:8000   (press "Memory" in the header)
+    # graph browser: http://localhost:3000
+    docker compose run --rm app python demo_memory.py
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+That brings up FalkorDB and the service with `MEMORY_BACKEND=graphiti`, so memory
+is durable in the graph and survives restarts. Your `.env` is read as-is and
+never written to — compose only adds the container-side settings on top.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### Providers
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Graphiti needs a chat model for extraction and an embedder for vectors.
+OpenRouter serves chat completions only, so the embedder defaults to
+`GRAPHITI_EMBEDDER=local` — a deterministic hashed bag-of-words vector in
+`graphiti_embedder.py`, no key and no model download. That means the whole graph
+runs on the single `OPENROUTER_API_KEY` you already have.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+The trade-off is honest: that embedder is lexical, not semantic, so wording that
+means the same thing in different words scores lower than a trained model would
+give it. Retrieval is hybrid (vector + BM25 + graph walk), so it still works.
+Set `GRAPHITI_EMBEDDER=openai` with `GRAPHITI_EMBEDDER_API_KEY` when you want
+real embeddings.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+In the console: `uvicorn api:app --reload`, then press **Memory** in the header.
+The panel lists every fact with `now` / `was` and the group it belongs to, plus
+the context injected at session start. State a preference in one session, reload
+the page, and it is still applied — `GET /memory` is the same data as JSON.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+### Tests
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+    pytest -q                                   everything hermetic
+    docker compose exec app pytest -q           the same suite inside the image
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+`tests/test_graphiti_backend.py` covers the Graphiti path with graphiti_core
+stubbed — the group-id charset, the empty-query listing and the per-group graph,
+which is where every production bug on that path came from. The live checks are
+each gated on their own:
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+    RUN_LIVE=1 pytest tests/test_live.py        Yarvel and OpenRouter
+    RUN_GRAPHITI=1 pytest tests/test_live.py    writes a fact into FalkorDB and reads it back
 
-## License
-For open source projects, say how it is licensed.
+## Enrichment
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+The supplier feed knows stars, amenities and price. It does not know that guests
+complain about the lifts, how far the hotel is from the Haram, that a wing has
+been closed since spring, or what the weather will do during the stay.
+
+Two tools cover that. `enrich_hotel_info` takes one hotel and answers on
+reputation, location, facilities and risk. `enrich_destination` takes a city and
+dates and answers on weather, travel advice and recent news.
+
+### Where the answers come from
+
+    open-meteo    weather, from a forecast API. No key, and numbers instead of prose.
+    openrouter    the web plugin on the key already in use, for general lookups.
+    playwright    one page, in a real browser, for sites that render nothing
+                  without JavaScript. Off unless you install it.
+
+Gemini was tried and dropped. Its grounding returns redirect urls the model never
+sees, so a claim it writes can never be matched to the page it came from — and an
+unmatchable claim is one we would have to drop anyway.
+
+Providers are asked in that order and the first useful answer wins. One that
+fails is recorded and skipped rather than retried. Configure with
+`WEB_SEARCH_BACKEND=openrouter` and `WEB_PLAYWRIGHT_ENABLED=true`; with neither
+set, only the weather provider runs, and the rest say so instead of inventing.
+
+A claim is kept only if its url appears in the search results the provider
+returned. If nothing came back to check against, the claim is dropped — a url the
+model wrote and no search returned is a guess wearing a citation.
+
+Playwright is not in `requirements.txt` on purpose — it pulls a browser. Install
+it when you want it:
+
+    pip install playwright && playwright install chromium
+
+### How a claim earns its place
+
+Every claim keeps the page it came from; one whose source cannot be confirmed is
+dropped rather than shown with a shrug. Then the evidence is counted, not scored:
+
+    corroborated    two different sites say it
+    single_source   one site says it, and the answer says so
+    conflicting     two sites disagree, and both readings are kept
+
+For the same field, agreement is decided on the numbers — "8.7 out of 10" and
+"8.7 / 10" are one rating, 8.7 and 8.4 are a disagreement worth showing. There is
+no confidence percentage anywhere in this, because there is no honest way to
+compute one from a handful of pages.
+
+Sources are ranked official, gov, maps, reviews, news, other, so a hotel's own
+page outranks an aggregator when they differ.
+
+Price, availability, board and cancellation come from the supplier alone. A
+money-shaped value is dropped as it is parsed, and `verify` fails a run whose web
+claims quote a price. Web text is treated as data throughout: instruction-shaped
+phrasing is stripped before any model sees it.
+
+Answers are cached for as long as they stay true — three hours for weather, a day
+for advisories and risk, six hours for news, a week for reputation, a month for
+location and facilities. Nothing runs on a timer; a caller asks, and the cache
+decides whether the stored answer is still good.
+
+## Agent context
+
+Each agent runs on its own `AgentContext`. When one agent needs another, it does
+not share that context:
+
+    handover = await delegate(OpsTriageAgent(), brief, llm, parent_ctx)
+
+The child gets the customer and the durable memory, because those belong to the
+person rather than to the conversation. It does not get the parent's session
+keys, tool results or retrieved facts — it builds its own prompt from the brief
+and answers that. What comes back is a `Handover`: the answer, which tools were
+used, and whether verification passed. None of the child's messages or tool
+payloads reach the caller's history.
+
+### Tests
+
+    pytest -q                                   everything hermetic
+    docker compose exec app pytest -q           the same suite inside the image
+
+`tests/test_graphiti_backend.py` covers the Graphiti path with graphiti_core
+stubbed. `tests/test_web_enrich.py` covers provider fallback, corroboration,
+disagreement, injected instructions and the money guard. Live checks are gated
+one by one:
+
+    RUN_LIVE=1 pytest tests/test_live.py        Yarvel and OpenRouter
+    RUN_GRAPHITI=1 pytest tests/test_live.py    writes a fact into FalkorDB and reads it back
+
+## Searching what was already fetched
+
+`enrich_hotel_info` and `enrich_destination` need the subject and the domain up
+front. `search_enrichment` does not — it takes a plain question and reads
+everything already fetched:
+
+    search_enrichment("which of these has a pool problem")
+    search_enrichment("what did we learn about Jeddah", entityType="city")
+    search_enrichment("renovation", entityRef="Carawan Hotel")
+
+Records are keyed the way the feed keys its snapshots — `entity_type` ("hotel" or
+"city") and `entity_ref` — so a row here lines up with a snapshot there without a
+translation step.
+
+Every claim is embedded as it is written, inside the same call that fetched it,
+so an embedding is never older than the claim it describes. One row per claim:
+they arrive already split at a natural boundary — a field, a value, its sources —
+so there is nothing to chunk, and splitting further would separate a fact from
+its citation. Vectors come from the same hashed embedder the memory layer uses,
+so the repo has one embedding scheme rather than two.
+
+That embedder matches words, not meaning. "how warm will it be" shares nothing
+with "29.2-34.5°C", so each domain carries a written list of the words people use
+for it (`DOMAIN_WORDS`), added to both the stored fact and the question. It covers
+the seven domains we own; a word nobody listed will still miss, and the test suite
+says so out loud. Swapping in a real embedding model is a change to `embed_text`
+alone.
+
+Storage is SQLite with the similarity done in Python. A dedicated vector database
+earns its keep at a scale this does not have — these are enrichment records for
+the hotels and cities in play, not a document corpus — and SQLite adds nothing to
+deploy, secure or back up. `VectorStore` is the seam to move behind pgvector the
+day those numbers change. The file opens on first use, and falls back to memory
+with a warning if the path is not writable.
+
+## Models
+
+The chat page offers whichever models are configured, default first:
+
+    OPENROUTER_MODEL / OPENROUTER_API_KEY        anthropic/claude-haiku-4.5
+    OPENROUTER_MODEL_B / OPENROUTER_API_KEY_B    poolside/laguna-xs-2.1
+    OPENROUTER_MODEL_C / OPENROUTER_API_KEY_C    google/gemma-4-31b-it
+
+Each carries its own key because they are separate accounts, and a request is
+paid for by the key belonging to the model it names — an unknown name falls back
+to the default rather than borrowing someone else's credit. Whether a model is
+listed with or without a `:free` suffix differs by account, so a name rejected as
+unknown is retried once with the other spelling.
+
+Switching model in the page starts a fresh conversation, since the transcript
+belongs to the model that produced it.

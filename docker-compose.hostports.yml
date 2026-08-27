@@ -1,0 +1,8 @@
+# Local-only port remap. Your other project already listens on host 8000, so the
+# app is published on 8001 instead. docker-compose.yml is untouched.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.hostports.yml up --build
+services:
+  app:
+    ports: !override
+      - "8001:8000"

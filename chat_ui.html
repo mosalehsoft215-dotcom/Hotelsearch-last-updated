@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TripOn Agents</title>
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#0f1620; --panel:#141c27; --panel2:#182230;
+    --line:#233043; --ink:#eaf1f8; --muted:#93a1b3; --accent:#4c8dff; --accent2:#7c5cff;
+    --ok:#37d67a; --bad:#ff6b6b; --chip:#1b2634;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       color:var(--ink);background:
+       radial-gradient(1200px 600px at 80% -10%, #16233a55, transparent),
+       radial-gradient(900px 500px at -10% 110%, #2a1c4a44, transparent), var(--bg);}
+  .app{display:flex;flex-direction:column;height:100vh;max-width:960px;margin:0 auto}
+  /* top bar */
+  .bar{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);
+       backdrop-filter:blur(6px)}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px}
+  .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+        display:grid;place-items:center;color:#fff;font-weight:800;font-size:13px}
+  .brand small{display:block;font-weight:500;color:var(--muted);font-size:11px;letter-spacing:.3px}
+  .spacer{flex:1}
+  /* agent switcher */
+  .seg{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px}
+  .seg button{border:0;background:transparent;color:var(--muted);padding:7px 14px;border-radius:8px;
+       font-weight:600;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:7px}
+  .seg button.active{background:var(--panel2);color:var(--ink);box-shadow:0 1px 0 #0006}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .dot.ops{background:var(--accent2)}
+  /* messages */
+  .scroll{flex:1;overflow-y:auto;padding:22px 20px}
+  .row{display:flex;gap:12px;margin:0 0 18px}
+  .row.me{flex-direction:row-reverse}
+  .av{width:30px;height:30px;border-radius:9px;flex:none;display:grid;place-items:center;font-size:13px;font-weight:700}
+  .av.ag{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  .av.me{background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+  .bubble{max-width:76%;padding:12px 15px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+  .me .bubble{background:linear-gradient(135deg,#25406e,#2b2f6b);border:1px solid #33518a}
+  .ag .bubble{background:var(--panel);border:1px solid var(--line)}
+  .meta{margin-top:8px;font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .badge{padding:2px 9px;border-radius:20px;font-weight:600;border:1px solid var(--line)}
+  .badge.ok{color:var(--ok);border-color:#37d67a44;background:#37d67a12}
+  .badge.bad{color:var(--bad);border-color:#ff6b6b44;background:#ff6b6b12}
+  .chip{padding:2px 9px;border-radius:20px;background:var(--chip);border:1px solid var(--line);color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11px}
+  .empty{color:var(--muted);text-align:center;margin-top:8vh}
+  .empty h2{color:var(--ink);font-weight:700;margin:0 0 6px}
+  .examples{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+  .examples button{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+       padding:9px 13px;border-radius:10px;cursor:pointer;font-size:13px}
+  .examples button:hover{border-color:var(--accent)}
+  /* composer */
+  .composer{display:flex;gap:10px;padding:14px 20px 20px;border-top:1px solid var(--line);background:linear-gradient(transparent,#0b0f14 40%)}
+  .composer input{flex:1;padding:13px 15px;border-radius:12px;border:1px solid var(--line);
+       background:var(--panel);color:var(--ink);font-size:15px;outline:none}
+  .composer input:focus{border-color:var(--accent)}
+  .composer button{padding:0 20px;border:0;border-radius:12px;font-weight:700;color:#fff;cursor:pointer;
+       background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  .composer button:disabled{opacity:.5;cursor:default}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="bar">
+    <div class="brand"><span class="logo">TR</span><span>TripOn · Rihla<small>Agent Console</small></span></div>
+    <div class="spacer"></div>
+    <select id="model" title="Model"></select>
+    <button class="memtoggle" id="memtoggle" type="button">Memory</button>
+    <div class="seg" id="seg">
+      <button data-agent="hotel" class="active"><span class="dot"></span>Hotel Search</button>
+      <button data-agent="triage"><span class="dot ops"></span>Ops Triage</button>
+    </div>
+  </div>
+  <div id="mem" hidden></div>
+  <div class="scroll" id="scroll"><div id="chat"></div><div class="empty" id="empty"></div></div>
+  <form class="composer" id="form">
+    <input id="input" type="text" autocomplete="off" />
+    <button id="send" type="submit">Send</button>
+  </form>
+</div>
+<script>
+  const AGENTS = {
+    hotel: { label:"Hotel Search", av:"H", placeholder:"Find hotels for a trip…",
+      title:"Hotel Search", sub:"Find hotels and lock a live rate for a quotation.",
+      examples:["Find a hotel by city, dates, and guests","2 rooms for 4 adults, 3 nights"] },
+    triage: { label:"Ops Triage", av:"O", placeholder:"Ask about the failed booking queue…",
+      title:"Ops Triage", sub:"Triage failed booking-queue messages into a report.",
+      examples:["Triage the failed booking queue","Summarise queue health and top failure types",
+                "What's failing most in the dead-letter queue?"] },
+  };
+  let agent = "hotel", sessionId = null, memOpen = false;
+  const modelPicker = document.getElementById("model");
+
+  fetch("/models").then(r => r.json()).then(d => {
+    (d.models || []).forEach((m, i) => {
+      const option = document.createElement("option");
+      option.value = m;
+      option.textContent = m.split("/").pop().replace(":free", "");
+      option.selected = (m === localStorage.getItem("model")) || (i === 0 && !localStorage.getItem("model"));
+      modelPicker.appendChild(option);
+    });
+  }).catch(() => { modelPicker.hidden = true; });
+
+  modelPicker.onchange = () => {
+    try { localStorage.setItem("model", modelPicker.value); } catch (e) {}
+    sessionId = null; chat.innerHTML = ""; renderEmpty();
+  };
+  const chat=document.getElementById("chat"), empty=document.getElementById("empty");
+  const input=document.getElementById("input"), send=document.getElementById("send");
+  const scroll=document.getElementById("scroll");
+
+  function renderEmpty(){
+    if(chat.children.length){ empty.innerHTML=""; return; }
+    const a=AGENTS[agent];
+    empty.innerHTML='<h2>'+a.title+'</h2><div style="color:var(--muted)">'+a.sub+'</div>'+
+      '<div class="examples">'+a.examples.map(e=>'<button>'+e+'</button>').join("")+'</div>';
+    empty.querySelectorAll("button").forEach(b=>b.onclick=()=>{input.value=b.textContent;input.focus();});
+  }
+  function setAgent(next){
+    agent=next; sessionId=null; chat.innerHTML="";
+    document.querySelectorAll("#seg button").forEach(b=>b.classList.toggle("active",b.dataset.agent===next));
+    input.placeholder=AGENTS[next].placeholder; renderEmpty(); input.focus();
+  }
+  document.querySelectorAll("#seg button").forEach(b=>b.onclick=()=>setAgent(b.dataset.agent));
+
+  function bubble(text, who){
+    empty.innerHTML="";
+    const row=document.createElement("div"); row.className="row "+(who==="me"?"me":"ag");
+    const av=document.createElement("div"); av.className="av "+(who==="me"?"me":"ag");
+    av.textContent = who==="me" ? "You" .slice(0,2) : AGENTS[agent].av;
+    const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
+    const wrap=document.createElement("div"); wrap.appendChild(b);
+    row.appendChild(av); row.appendChild(wrap); chat.appendChild(row);
+    scroll.scrollTop=scroll.scrollHeight; return b;
+  }
+  function meta(after, data){
+    const v=data.verification||{}; const m=document.createElement("div"); m.className="meta";
+    const badge = v.passed ? '<span class="badge ok">verified</span>'
+                           : '<span class="badge bad">'+(v.issues||[]).join("; ")+'</span>';
+    const tools=(data.tools_called||[]).map(t=>'<span class="chip">'+t+'</span>').join("");
+    m.innerHTML=badge+tools; after.parentElement.appendChild(m);
+  }
+
+  const mem = document.getElementById("mem");
+  const memBtn = document.getElementById("memtoggle");
+
+  async function loadMemory(){
+    if(!memOpen) return;
+    try{
+      const res = await fetch("/memory");
+      const d = await res.json();
+      if(d.error){ mem.innerHTML = '<div class="memcard">'+d.error+'</div>'; return; }
+      const facts = (d.facts||[]).map(f =>
+        '<div class="fact"><span class="pill '+(f.current?'cur':'old')+'">'+
+        (f.current?'now':'was')+'</span><div>'+f.statement+
+        '<div class="grp">'+f.group+(f.key?' · '+f.key:'')+
+        (f.invalid_at?' · until '+f.invalid_at.slice(0,10):'')+'</div></div></div>').join("");
+      mem.innerHTML = '<div class="memcard"><h4>Durable memory · backend: '+d.backend+
+        ' · '+d.username+'</h4>'+(facts||'<div class="fact">Nothing stored yet.</div>')+
+        (d.context?'<div class="recall">Injected at session start:\n'+d.context+'</div>':'')+'</div>';
+    }catch(err){ mem.innerHTML = '<div class="memcard">'+err+'</div>'; }
+  }
+  memBtn.onclick = () => {
+    memOpen = !memOpen;
+    mem.hidden = !memOpen;
+    memBtn.classList.toggle("on", memOpen);
+    loadMemory();
+  };
+
+  document.getElementById("form").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const text=input.value.trim(); if(!text) return;
+    bubble(text,"me"); input.value=""; send.disabled=true;
+    const thinking=bubble("…","ag");
+    try{
+      const res=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({message:text, agent, session_id:sessionId,
+                             model: modelPicker.value || undefined})});
+      const raw=await res.text(); let data;
+      try{ data=JSON.parse(raw); }
+      catch{ thinking.textContent="Server error: "+raw.slice(0,300); return; }
+      sessionId=data.session_id||sessionId;
+      if(data.error){ thinking.textContent="⚠ "+data.error; }
+      else{ thinking.textContent=data.output||"(no reply)"; meta(thinking,data); loadMemory(); }
+    }catch(err){ thinking.textContent="⚠ request failed: "+err; }
+    finally{ send.disabled=false; input.focus(); scroll.scrollTop=scroll.scrollHeight; }
+  });
+  setAgent("hotel");
+</script>
+</body>
+</html>
