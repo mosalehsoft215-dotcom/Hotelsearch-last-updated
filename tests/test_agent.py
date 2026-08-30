@@ -614,3 +614,35 @@ async def test_a_flip_that_lands_nowhere_reports_the_original_failure():
     assert "inclusionai/ling-3.0-flash-fin:free" in message, "and it names the configured model"
     assert "No endpoints found" not in message
     assert llm.model == "inclusionai/ling-3.0-flash-fin:free", "the name is restored"
+
+
+@pytest.mark.asyncio
+async def test_provider_tool_call_fields_survive_the_round_trip():
+    """Gemini attaches a thought_signature under extra_content and rejects the
+    next turn without it: "Function call is missing a thought_signature in
+    functionCall parts". Rebuilding the call from name+arguments dropped it."""
+    from runtime import LLMResponse
+    signed = {"id": "c1", "type": "function",
+              "extra_content": {"google": {"thought_signature": "EukCCuYCARFNMg"}},
+              "function": {"name": "search_hotel_availability", "arguments": "{}"}}
+    transport, seen = _status_transport([
+        (200, {"choices": [{"message": {"role": "assistant", "tool_calls": [signed]}}]}),
+        (200, {"choices": [{"message": {"content": "done"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="gemini-flash-latest",
+                        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                        transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.tool_calls[0].raw == signed, "the provider's dict is kept verbatim"
+
+    ctx = _ctx()
+    llm2 = OpenRouterLLM(api_key="k", model="gemini-flash-latest",
+                         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                         transport=_status_transport([
+                             (200, {"choices": [{"message": {"role": "assistant",
+                                                             "tool_calls": [signed]}}]}),
+                             (200, {"choices": [{"message": {"content": "done"}}]}),
+                         ])[0])
+    res = await HotelSearchAgent().run(ctx, "find hotels", llm2, max_iterations=3)
+    echoed = next(m for m in res.messages if m.get("tool_calls"))
+    assert echoed["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "EukCCuYCARFNMg"

@@ -98,6 +98,11 @@ class LLMToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # The provider's own dict, kept verbatim. Gemini attaches a
+    # thought_signature under extra_content and rejects the next turn without
+    # it — "Function call is missing a thought_signature in functionCall parts"
+    # — so a rebuilt-from-parts tool call cannot continue the conversation.
+    raw: dict[str, Any] | None = None
 
 
 @dataclass
@@ -219,7 +224,8 @@ class OpenRouterLLM:
                 args = json.loads(raw) if isinstance(raw, str) else dict(raw)
             except json.JSONDecodeError as exc:
                 raise LLMError(f"tool call arguments were not valid JSON: {exc.msg}") from exc
-            calls.append(LLMToolCall(id=tc.get("id") or fn.get("name", ""), name=fn.get("name", ""), arguments=args))
+            calls.append(LLMToolCall(id=tc.get("id") or fn.get("name", ""), name=fn.get("name", ""),
+                                     arguments=args, raw=tc))
 
         return LLMResponse(content=message.get("content"), tool_calls=calls)
 
@@ -235,7 +241,10 @@ def build_llm(settings: Settings | None = None, model: str | None = None) -> Ope
     if s.llm_provider != "openrouter":
         raise LLMError(f"unsupported LLM_PROVIDER {s.llm_provider!r}; only 'openrouter' is implemented")
     chosen, api_key = s.credentials_for(model)
-    return OpenRouterLLM(api_key=api_key, model=chosen,
+    # 60s is not enough for a reasoning model behind a tool loop: Gemini returns
+    # a thought_signature blob per call and timed out mid-turn, surfacing as
+    # "OpenRouter request failed:" with nothing after the colon.
+    return OpenRouterLLM(api_key=api_key, model=chosen, timeout=180.0,
                          base_url=s.base_url_for(chosen), max_tokens=s.openrouter_max_tokens)
 
 
@@ -631,7 +640,10 @@ class AgentBase(ABC):
                 break
             messages.append({
                 "role": "assistant", "content": resp.content or "",
-                "tool_calls": [{
+                # Echo the provider's own tool_call dict when we have it, so
+                # fields we do not model (Gemini's thought_signature) survive
+                # the round trip.
+                "tool_calls": [tc.raw or {
                     "id": tc.id, "type": "function",
                     "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
                 } for tc in resp.tool_calls],
