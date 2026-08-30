@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TripOn Agents</title>
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#0f1620; --panel:#141c27; --panel2:#182230;
+    --line:#233043; --ink:#eaf1f8; --muted:#93a1b3; --accent:#4c8dff; --accent2:#7c5cff;
+    --ok:#37d67a; --bad:#ff6b6b; --chip:#1b2634;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       color:var(--ink);background:
+       radial-gradient(1200px 600px at 80% -10%, #16233a55, transparent),
+       radial-gradient(900px 500px at -10% 110%, #2a1c4a44, transparent), var(--bg);}
+  .app{display:flex;flex-direction:column;height:100vh;max-width:960px;margin:0 auto}
+  /* top bar */
+  .bar{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);
+       backdrop-filter:blur(6px)}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px}
+  .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+        display:grid;place-items:center;color:#fff;font-weight:800;font-size:13px}
+  .brand small{display:block;font-weight:500;color:var(--muted);font-size:11px;letter-spacing:.3px}
+  .spacer{flex:1}
+  /* agent switcher */
+  .seg{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px}
+  .seg button{border:0;background:transparent;color:var(--muted);padding:7px 14px;border-radius:8px;
+       font-weight:600;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:7px}
+  .seg button.active{background:var(--panel2);color:var(--ink);box-shadow:0 1px 0 #0006}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .dot.ops{background:var(--accent2)}
+  /* messages */
+  .scroll{flex:1;overflow-y:auto;padding:22px 20px}
+  .row{display:flex;gap:12px;margin:0 0 18px}
+  .row.me{flex-direction:row-reverse}
+  .av{width:30px;height:30px;border-radius:9px;flex:none;display:grid;place-items:center;font-size:13px;font-weight:700}
+  .av.ag{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  .av.me{background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+  .bubble{max-width:76%;padding:12px 15px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+  .me .bubble{background:linear-gradient(135deg,#25406e,#2b2f6b);border:1px solid #33518a}
+  .ag .bubble{background:var(--panel);border:1px solid var(--line)}
+  .meta{margin-top:8px;font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .badge{padding:2px 9px;border-radius:20px;font-weight:600;border:1px solid var(--line)}
+  .badge.ok{color:var(--ok);border-color:#37d67a44;background:#37d67a12}
+  .badge.bad{color:var(--bad);border-color:#ff6b6b44;background:#ff6b6b12}
+  .chip{padding:2px 9px;border-radius:20px;background:var(--chip);border:1px solid var(--line);color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11px}
+  .empty{color:var(--muted);text-align:center;margin-top:8vh}
+  .empty h2{color:var(--ink);font-weight:700;margin:0 0 6px}
+  .examples{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+  .examples button{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+       padding:9px 13px;border-radius:10px;cursor:pointer;font-size:13px}
+  .examples button:hover{border-color:var(--accent)}
+  /* bar controls */
+  #model{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:9px;
+       padding:7px 9px;font-size:12px;font-weight:600;outline:none;max-width:170px;cursor:pointer}
+  #model:focus{border-color:var(--accent)}
+  .tgl{background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:9px;
+       padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  .tgl:hover{color:var(--ink);border-color:var(--accent)}
+  .tgl.on{color:var(--ink);background:var(--panel2);border-color:var(--accent)}
+  /* side panels — memory + enrichment */
+  #mem,#enr{padding:0 20px;margin-top:14px}
+  .memcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .memcard h4{margin:0 0 10px;font-size:12px;font-weight:700;color:var(--muted);
+       letter-spacing:.4px;text-transform:uppercase}
+  .fact{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line);font-size:13px}
+  .fact:first-of-type{border-top:0}
+  .pill{flex:none;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;
+       font-family:ui-monospace,Menlo,monospace;border:1px solid var(--line)}
+  .pill.cur{color:var(--ok);border-color:#37d67a44;background:#37d67a12}
+  .pill.old{color:var(--muted);background:var(--chip)}
+  .grp{color:var(--muted);font-size:11.5px;margin-top:2px;font-family:ui-monospace,Menlo,monospace}
+  .grp a{color:var(--accent);text-decoration:none}
+  .grp a:hover{text-decoration:underline}
+  .recall{margin-top:12px;padding:10px 12px;border-radius:9px;background:var(--panel2);
+       border:1px solid var(--line);color:var(--muted);font-size:12px;white-space:pre-wrap}
+  .enrsearch{display:flex;gap:8px;margin-bottom:10px}
+  .enrsearch input{flex:1;padding:9px 12px;border-radius:9px;border:1px solid var(--line);
+       background:var(--panel2);color:var(--ink);font-size:13px;outline:none}
+  .enrsearch input:focus{border-color:var(--accent)}
+  .enrsearch button{padding:0 16px;border:1px solid var(--line);border-radius:9px;background:var(--panel2);
+       color:var(--ink);font-weight:600;font-size:13px;cursor:pointer}
+  .enrsearch button:hover{border-color:var(--accent)}
+  /* delegation */
+  .delrow{display:flex;gap:8px;padding:0 20px;margin-top:14px}
+  .delrow input{flex:1;padding:9px 12px;border-radius:9px;border:1px solid var(--line);
+       background:var(--panel);color:var(--ink);font-size:13px;outline:none}
+  .delrow input:focus{border-color:var(--accent2)}
+  .delrow button{padding:0 16px;border:1px solid var(--line);border-radius:9px;background:var(--panel);
+       color:var(--ink);font-weight:600;font-size:13px;cursor:pointer}
+  .delrow button:hover{border-color:var(--accent2)}
+  .bubble.hand{border-color:#7c5cff55;background:linear-gradient(180deg,#1a1630,#141c27)}
+  .handhead{font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+       color:var(--accent2);margin-bottom:7px}
+  .parentline{margin-top:6px;font-size:12px;color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+  .parentline.ok{color:var(--ok)}
+  .parentline.bad{color:var(--bad)}
+  /* composer */
+  .composer{display:flex;gap:10px;padding:14px 20px 20px;border-top:1px solid var(--line);background:linear-gradient(transparent,#0b0f14 40%)}
+  .composer input{flex:1;padding:13px 15px;border-radius:12px;border:1px solid var(--line);
+       background:var(--panel);color:var(--ink);font-size:15px;outline:none}
+  .composer input:focus{border-color:var(--accent)}
+  .composer button{padding:0 20px;border:0;border-radius:12px;font-weight:700;color:#fff;cursor:pointer;
+       background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  .composer button:disabled{opacity:.5;cursor:default}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="bar">
+    <div class="brand"><span class="logo">TR</span><span>TripOn · Rihla<small>Agent Console</small></span></div>
+    <div class="spacer"></div>
+    <select id="model" title="Model"></select>
+    <button class="tgl" id="memtoggle" type="button">Memory</button>
+    <button class="tgl" id="enrtoggle" type="button">Enrichment</button>
+    <button class="tgl" id="deltoggle" type="button" title="Hand a brief to the ops agent">Delegate</button>
+    <div class="seg" id="seg">
+      <button data-agent="hotel" class="active"><span class="dot"></span>Hotel Search</button>
+      <button data-agent="triage"><span class="dot ops"></span>Ops Triage</button>
+    </div>
+  </div>
+  <div id="mem" hidden></div>
+  <div id="enr" hidden>
+    <div class="memcard">
+      <h4>Enrichment index · <span id="enrcount">–</span> claims</h4>
+      <div class="enrsearch">
+        <input id="enrq" type="text" autocomplete="off"
+               placeholder="Ask in plain words — e.g. how warm will it be" />
+        <button id="enrgo" type="button">Search</button>
+      </div>
+      <div id="enrout"></div>
+    </div>
+  </div>
+  <div class="delrow" id="delrow" hidden>
+    <input id="delbrief" type="text" autocomplete="off"
+           placeholder="Brief for the ops agent — e.g. summarise the failed booking queue" />
+    <button id="delgo" type="button">Hand over</button>
+  </div>
+  <div class="scroll" id="scroll"><div id="chat"></div><div class="empty" id="empty"></div></div>
+  <form class="composer" id="form">
+    <input id="input" type="text" autocomplete="off" />
+    <button id="send" type="submit">Send</button>
+  </form>
+</div>
+<script>
+  const AGENTS = {
+    hotel: { label:"Hotel Search", av:"H", placeholder:"Find hotels for a trip…",
+      title:"Hotel Search", sub:"Find hotels and lock a live rate for a quotation.",
+      examples:["Find a hotel by city, dates, and guests","2 rooms for 4 adults, 3 nights"] },
+    triage: { label:"Ops Triage", av:"O", placeholder:"Ask about the failed booking queue…",
+      title:"Ops Triage", sub:"Triage failed booking-queue messages into a report.",
+      examples:["Triage the failed booking queue","Summarise queue health and top failure types",
+                "What's failing most in the dead-letter queue?"] },
+  };
+  let agent = "hotel", sessionId = null, memOpen = false;
+  const modelPicker = document.getElementById("model");
+
+  fetch("/models").then(r => r.json()).then(d => {
+    (d.models || []).forEach((m, i) => {
+      const option = document.createElement("option");
+      option.value = m;
+      option.textContent = m.split("/").pop().replace(":free", "");
+      option.selected = (m === localStorage.getItem("model")) || (i === 0 && !localStorage.getItem("model"));
+      modelPicker.appendChild(option);
+    });
+  }).catch(() => { modelPicker.hidden = true; });
+
+  modelPicker.onchange = () => {
+    try { localStorage.setItem("model", modelPicker.value); } catch (e) {}
+    sessionId = null; chat.innerHTML = ""; renderEmpty();
+  };
+  const chat=document.getElementById("chat"), empty=document.getElementById("empty");
+  const input=document.getElementById("input"), send=document.getElementById("send");
+  const scroll=document.getElementById("scroll");
+
+  function renderEmpty(){
+    if(chat.children.length){ empty.innerHTML=""; return; }
+    const a=AGENTS[agent];
+    empty.innerHTML='<h2>'+a.title+'</h2><div style="color:var(--muted)">'+a.sub+'</div>'+
+      '<div class="examples">'+a.examples.map(e=>'<button>'+e+'</button>').join("")+'</div>';
+    empty.querySelectorAll("button").forEach(b=>b.onclick=()=>{input.value=b.textContent;input.focus();});
+  }
+  function setAgent(next){
+    agent=next; sessionId=null; chat.innerHTML="";
+    document.querySelectorAll("#seg button").forEach(b=>b.classList.toggle("active",b.dataset.agent===next));
+    input.placeholder=AGENTS[next].placeholder; renderEmpty(); input.focus();
+  }
+  document.querySelectorAll("#seg button").forEach(b=>b.onclick=()=>setAgent(b.dataset.agent));
+
+  function bubble(text, who){
+    empty.innerHTML="";
+    const row=document.createElement("div"); row.className="row "+(who==="me"?"me":"ag");
+    const av=document.createElement("div"); av.className="av "+(who==="me"?"me":"ag");
+    av.textContent = who==="me" ? "You" : AGENTS[agent].av;
+    const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
+    const wrap=document.createElement("div"); wrap.appendChild(b);
+    row.appendChild(av); row.appendChild(wrap); chat.appendChild(row);
+    scroll.scrollTop=scroll.scrollHeight; return b;
+  }
+  /* A key with no credit answers 402 with a page of JSON. Mid-demo that reads as a
+     crash; it is one dropdown away from working, so say that instead. */
+  function readable(err){
+    const raw = String(err || "");
+    if(/\b402\b|credit|can only afford/i.test(raw))
+      return "This model's key has no credit left. Pick another model from the dropdown above — the rest of the session is unaffected.";
+    if(/\b(401|403)\b|unauthor/i.test(raw))
+      return "This model's key was rejected. Pick another model from the dropdown above.";
+    if(/no such model|not a valid model/i.test(raw))
+      return "This account cannot reach that model. Pick another from the dropdown above.";
+    return raw.length > 240 ? raw.slice(0, 240) + "…" : raw;
+  }
+
+  // One builder for both a normal reply and a handover. Nodes, not markup — the
+  // issue strings and tool names are ours today, and this stops caring tomorrow.
+  function metaRow(passed, issues, tools){
+    const m=el("div","meta");
+    m.appendChild(passed ? el("span","badge ok","verified")
+                         : el("span","badge bad",(issues||[]).join("; ") || "not verified"));
+    (tools||[]).forEach(t => m.appendChild(el("span","chip", t)));
+    return m;
+  }
+  function meta(after, data){
+    const v=data.verification||{};
+    after.parentElement.appendChild(metaRow(v.passed, v.issues, data.tools_called));
+  }
+
+  const mem = document.getElementById("mem");
+  const memBtn = document.getElementById("memtoggle");
+
+  async function loadMemory(){
+    if(!memOpen) return;
+    try{
+      const res = await fetch("/memory");
+      const d = await res.json();
+      if(d.error){ mem.replaceChildren(el("div","memcard", readable(d.error))); return; }
+      // Statements are whatever the user typed. Build nodes, never innerHTML.
+      mem.replaceChildren();
+      const card = el("div","memcard");
+      card.appendChild(el("h4", null, "Durable memory · backend: "+d.backend+" · "+d.username));
+      (d.facts||[]).forEach(f => {
+        const row = el("div","fact");
+        row.appendChild(el("span","pill "+(f.current?"cur":"old"), f.current?"now":"was"));
+        const body = el("div", null, f.statement);
+        body.appendChild(el("div","grp",
+          f.group + (f.key ? " · "+f.key : "") +
+          (f.invalid_at ? " · until "+f.invalid_at.slice(0,10) : "")));
+        row.appendChild(body);
+        card.appendChild(row);
+      });
+      if(!(d.facts||[]).length) card.appendChild(note("Nothing stored yet."));
+      if(d.context) card.appendChild(el("div","recall","Injected at session start:\n"+d.context));
+      mem.appendChild(card);
+    }catch(err){ mem.replaceChildren(el("div","memcard", readable(err))); }
+  }
+  memBtn.onclick = () => {
+    memOpen = !memOpen;
+    mem.hidden = !memOpen;
+    memBtn.classList.toggle("on", memOpen);
+    loadMemory();
+  };
+
+  /* ---- enrichment index: what RAG actually retrieved, with its score and source ---- */
+  const enr=document.getElementById("enr"), enrBtn=document.getElementById("enrtoggle");
+  const enrQ=document.getElementById("enrq"), enrOut=document.getElementById("enrout");
+  const enrCount=document.getElementById("enrcount");
+  let enrOpen=false;
+
+  function host(u){ try{ return new URL(u).hostname.replace(/^www\./,""); }catch{ return u; } }
+  // Claim values and titles are scraped web text. neutralise() strips prompt
+  // injection server-side, not HTML — so nothing here reaches innerHTML.
+  function el(tag, cls, text){
+    const n=document.createElement(tag);
+    if(cls) n.className=cls;
+    if(text!=null) n.textContent=text;
+    return n;
+  }
+  function safeLink(url){
+    let ok=false;
+    try{ ok=["http:","https:"].includes(new URL(url).protocol); }catch{}
+    if(!ok) return el("span", null, "source withheld");
+    const a=el("a", null, host(url));
+    a.href=url; a.target="_blank"; a.rel="noopener noreferrer";
+    return a;
+  }
+  function note(text){ const d=el("div","fact"); d.appendChild(el("div",null,text)); return d; }
+
+  async function enrichQuery(q){
+    enrOut.replaceChildren();
+    try{
+      const res = await fetch("/enrichment?q="+encodeURIComponent(q||""));
+      const d = await res.json();
+      enrCount.textContent = (d.indexed_claims ?? "–");
+      if(d.error){ enrOut.appendChild(note(readable(d.error))); return; }
+      if(!q) return;
+      (d.matches||[]).forEach(m=>{
+        const row=el("div","fact");
+        row.appendChild(el("span","pill cur", String(m.match ?? "")));
+        const body=el("div");
+        body.appendChild(el("div",null, m.domain+" · "+m.field));
+        body.appendChild(el("div","grp", m.value||""));
+        const meta=el("div","grp", m.status+" · "+m.entity_type+":"+m.entity_ref+" · ");
+        const src=(m.sources||[])[0];
+        meta.appendChild(src ? safeLink(src.url) : el("span",null,"no source"));
+        body.appendChild(meta);
+        row.appendChild(body);
+        enrOut.appendChild(row);
+      });
+      // An empty result is a real answer here, not a blank panel — show what the tool said.
+      if(!(d.matches||[]).length) enrOut.appendChild(note(d.note || "no match"));
+    }catch(err){ enrOut.appendChild(note(readable(err))); }
+  }
+  enrBtn.onclick=()=>{ enrOpen=!enrOpen; enr.hidden=!enrOpen; enrBtn.classList.toggle("on",enrOpen);
+                       if(enrOpen) enrichQuery(enrQ.value.trim()); };
+  document.getElementById("enrgo").onclick=()=>enrichQuery(enrQ.value.trim());
+  enrQ.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); enrichQuery(enrQ.value.trim()); }});
+
+  /* ---- delegation: a person hands a brief to the ops agent; the caller must not move ---- */
+  // Both actions run against the same session context. If a chat is mid-flight when
+  // a handover is taken, the parent snapshot straddles the chat's own tool calls and
+  // the page reports "parent CHANGED" with no isolation failure behind it. One lock.
+  function busy(on){ send.disabled = on; delGo.disabled = on; }
+
+  const delRow=document.getElementById("delrow"), delBtn=document.getElementById("deltoggle");
+  const delBrief=document.getElementById("delbrief"), delGo=document.getElementById("delgo");
+  let delOpen=false;
+  delBtn.onclick=()=>{ delOpen=!delOpen; delRow.hidden=!delOpen; delBtn.classList.toggle("on",delOpen);
+                       if(delOpen) delBrief.focus(); };
+
+  delGo.onclick=async ()=>{
+    const brief=delBrief.value.trim();
+    if(!brief) return;
+    if(!sessionId){ bubble("Send a message first — delegation runs on an existing session.","ag"); return; }
+    busy(true);
+    const pending=bubble("handing over…","ag");
+    try{
+      const res=await fetch("/delegate",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({session_id:sessionId, brief, agent:"triage",
+                             model: modelPicker.value || undefined})});
+      const d=await res.json();
+      if(d.error){ pending.textContent="⚠ "+readable(d.error); return; }
+      const h=d.handover||{};
+      pending.classList.add("hand");
+      pending.replaceChildren(el("div","handhead","Handover · "+(h.agent||"agent")));
+      pending.appendChild(document.createTextNode(h.answer||"(no answer)"));
+      pending.parentElement.appendChild(metaRow(h.verified, h.issues, h.tools_used));
+      // The claim being demonstrated: the child ran, the caller did not move.
+      const p=document.createElement("div");
+      p.className="parentline "+(d.parent_unchanged?"ok":"bad");
+      p.textContent = d.parent_unchanged
+        ? "parent unchanged — tool_calls "+(d.parent_before.tool_calls||[]).length+
+          ", session keys ["+(d.parent_before.session_keys||[]).join(", ")+"] identical either side"
+        : "parent CHANGED — before "+JSON.stringify(d.parent_before)+" after "+JSON.stringify(d.parent_after);
+      pending.parentElement.appendChild(p);
+      delBrief.value="";
+    }catch(err){ pending.textContent="⚠ delegate failed: "+readable(err); }
+    finally{ busy(false); scroll.scrollTop=scroll.scrollHeight; }
+  };
+
+  document.getElementById("form").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const text=input.value.trim(); if(!text) return;
+    bubble(text,"me"); input.value=""; busy(true);
+    const thinking=bubble("…","ag");
+    try{
+      const res=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({message:text, agent, session_id:sessionId,
+                             model: modelPicker.value || undefined})});
+      const raw=await res.text(); let data;
+      try{ data=JSON.parse(raw); }
+      catch{ thinking.textContent="Server error: "+readable(raw); return; }
+      sessionId=data.session_id||sessionId;
+      if(data.error){ thinking.textContent="⚠ "+readable(data.error); }
+      else{ thinking.textContent=data.output||"(no reply)"; meta(thinking,data); loadMemory();
+            if(enrOpen) enrichQuery(enrQ.value.trim()); }
+    }catch(err){ thinking.textContent="⚠ request failed: "+readable(err); }
+    finally{ busy(false); input.focus(); scroll.scrollTop=scroll.scrollHeight; }
+  });
+  setAgent("hotel");
+</script>
+</body>
+</html>

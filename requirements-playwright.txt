@@ -1,0 +1,7 @@
+# Only needed for WEB_PLAYWRIGHT_ENABLED=true, the enrichment provider that reads
+# one page in a real browser. Kept out of requirements.txt because the browser is
+# a ~150 MB download the rest of the service does not need.
+#
+#   pip install -r requirements-playwright.txt
+#   playwright install chromium
+playwright>=1.44

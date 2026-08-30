@@ -1,0 +1,10 @@
+# Only needed for MEMORY_BACKEND=graphiti. Installed in the Docker image.
+graphiti-core[falkordb]>=0.29.0
+
+# falkordb 1.6.2 declares redis>=7.1.0 with no upper bound, but on redis 8.1.0
+# its cluster probe forwards async-only connection kwargs into the *sync*
+# client: falkordb/asyncio/cluster.py does Redis(**kwargs), and 8.1.0 added
+# himport_registry to those kwargs, so startup dies with
+#   TypeError: Redis.__init__() got an unexpected keyword argument 'himport_registry'
+# Drop this pin once falkordb ships a fix.
+redis<8.1
