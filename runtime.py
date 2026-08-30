@@ -79,6 +79,7 @@ The agent loop only needs `complete(messages, tools) -> LLMResponse`. Tool calls
 come back normalised so the loop never touches provider-specific JSON.
 """
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -91,6 +92,13 @@ from config import Settings, get_settings
 
 class LLMError(RuntimeError):
     pass
+
+
+# Retried with backoff rather than raised: rate limits and capacity. Google
+# documents exactly this for the Gemini endpoint, and 503 "experiencing high
+# demand" clears on a second attempt more often than not.
+_TRANSIENT = frozenset({408, 429, 500, 502, 503, 504})
+_BACKOFF = (1.0, 4.0)
 
 
 @dataclass
@@ -124,6 +132,13 @@ class OpenRouterLLM:
         self.max_tokens = max_tokens
         self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
+    @property
+    def host(self) -> str:
+        """What to name in an error. Four providers share this client now, so
+        "OpenRouter HTTP 503" was wrong for three of them."""
+        from urllib.parse import urlparse
+        return (urlparse(self.base_url).netloc or self.base_url).removeprefix("www.")
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -144,9 +159,12 @@ class OpenRouterLLM:
         # afford 527 reported "you requested up to 4000" and no retry at all.
         tried_other_spelling = False
         tried_budget = False
+        transient_retries = 0
         original_model = self.model
         first_failure: tuple[int, str] | None = None
-        for attempt in range(3):
+        # Enough attempts for two transient backoffs plus a budget trim plus a
+        # spelling flip; every path sets a flag, so none of them can loop.
+        for attempt in range(5):
             body = dict(base)
             body["model"] = self.model
             if self.max_tokens:
@@ -157,7 +175,11 @@ class OpenRouterLLM:
                     headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
                 )
             except httpx.HTTPError as exc:
-                raise LLMError(f"OpenRouter request failed: {exc}") from exc
+                # ReadTimeout stringifies to "", so the old message ended at the
+                # colon and said nothing at all. Name the class and the host.
+                raise LLMError(
+                    f"{self.host} request failed: {type(exc).__name__}"
+                    f"{f': {exc}' if str(exc) else ''}") from exc
 
             if resp.status_code == 402 and not tried_budget:
                 afford = re.search(r"can only afford (\d+)", resp.text)
@@ -184,11 +206,21 @@ class OpenRouterLLM:
             # it elsewhere turns a readable error into "the model
             # `groq/compound:free` does not exist", which sends you hunting for
             # a model that was never the problem.
+            # Transient: capacity and rate limits. Google documents backoff
+            # for 429/408/5xx, and a single 503 "experiencing high demand" was
+            # being surfaced as a dead end after exactly one attempt.
+            if resp.status_code in _TRANSIENT and transient_retries < 2:
+                transient_retries += 1
+                await asyncio.sleep(_BACKOFF[transient_retries - 1])
+                continue
+
+            # Only a naming 404/400 flips the spelling. Flipping on 429 was a
+            # gamble that could land on the paid twin of a free model, and a
+            # rate limit is not a naming problem — it is retried above instead.
             if (not tried_other_spelling
                     and "openrouter.ai" in self.base_url
-                    and (resp.status_code == 429
-                         or (resp.status_code in (400, 404)
-                             and re.search(r"model|no endpoints", resp.text, re.I)))):
+                    and resp.status_code in (400, 404)
+                    and re.search(r"model|no endpoints", resp.text, re.I)):
                 tried_other_spelling = True
                 first_failure = (resp.status_code, resp.text)
                 self.model = free_variant(self.model)
@@ -203,8 +235,8 @@ class OpenRouterLLM:
                         r"no endpoints|does not exist|not a valid model", resp.text, re.I):
                     status, text = first_failure
                     self.model = original_model
-                    raise LLMError(f"OpenRouter HTTP {status} for {original_model}: {text[:400]}")
-                raise LLMError(f"OpenRouter HTTP {resp.status_code}: {resp.text[:500]}")
+                    raise LLMError(f"{self.host} HTTP {status} for {original_model}: {text[:400]}")
+                raise LLMError(f"{self.host} HTTP {resp.status_code}: {resp.text[:500]}")
             break
 
         data = resp.json()

@@ -60,11 +60,15 @@ _TIER_HOSTS = {
              "gulfnews.com", "saudigazette."),
 }
 
+# re.I as a flag, not inline (?i) repeated per branch. Python 3.11 turned a
+# mid-pattern global flag into re.error ("global flags not at the start of the
+# expression"), so the inline form imported fine on 3.10 and killed the 3.12
+# image the Dockerfile builds — before any test could run.
 _INJECTION = re.compile(
-    r"(?i)\b(ignore|disregard|forget)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b"
-    r"|(?i)\b(system|developer)\s+(prompt|message|instruction)"
-    r"|(?i)\byou\s+are\s+now\b|(?i)\bnew\s+instructions?\b"
-    r"|(?i)\b(confirm|complete|place|make)\s+(the\s+)?booking\b")
+    r"\b(ignore|disregard|forget)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b"
+    r"|\b(system|developer)\s+(prompt|message|instruction)"
+    r"|\byou\s+are\s+now\b|\bnew\s+instructions?\b"
+    r"|\b(confirm|complete|place|make)\s+(the\s+)?booking\b", re.I)
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _CURRENCY = r"usd|eur|gbp|sar|aed|egp|kwd|qar|dollars?|euros?|pounds?|riyals?|dirhams?"
 # Both orders. "$420" and "420 USD" are the same fact and the supplier owns both.
@@ -479,8 +483,15 @@ class Cache:
         self._entries: dict[tuple, tuple[float, Enrichment]] = {}
 
     @staticmethod
-    def key(subject: str, domain: str, providers: Iterable[str]) -> tuple:
-        return (subject.strip().lower(), domain, tuple(sorted(providers)), SCHEMA_VERSION)
+    def key(subject: str, domain: str, providers: Iterable[str],
+            context: dict[str, Any] | None = None) -> tuple:
+        """The dates belong in the key. Without them a September forecast for
+        Jeddah was served for an October stay — same city, same domain, same
+        providers, so it hit and never called open-meteo again."""
+        context = context or {}
+        window = (context.get("check_in"), context.get("check_out"))
+        return (subject.strip().lower(), domain, tuple(sorted(providers)),
+                window, SCHEMA_VERSION)
 
     def get(self, key: tuple, fresh_for: int) -> Enrichment | None:
         entry = self._entries.get(key)
@@ -520,7 +531,7 @@ class Enricher:
                               entity_ref=entity_ref or subject,
                               note=f"no provider configured for {domain}")
 
-        key = Cache.key(subject, domain, [p.name for p in usable])
+        key = Cache.key(subject, domain, [p.name for p in usable], context)
         if use_cache:
             cached = self.cache.get(key, FRESH_FOR_SECONDS.get(domain, 3600))
             if cached is not None:

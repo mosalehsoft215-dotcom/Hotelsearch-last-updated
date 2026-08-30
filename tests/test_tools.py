@@ -889,3 +889,23 @@ async def test_availability_options_filters_on_flattened_records(fake_hasura):
     capped = await srv.get_hotel_availability_options(
         organizationId=ORG, uuid="U1", hotelCode="H1", maxPrice=200)
     assert [o.optionId for o in capped] == ["OPT-1", "OPT-2"]
+
+
+@pytest.mark.asyncio
+async def test_get_hotel_booking_will_not_return_another_orgs_row(fake_hasura):
+    """Core_HotelBookings_by_pk takes only the primary key, and the admin secret
+    bypasses row permissions — so a guessed numeric Id read across tenants."""
+    fake_hasura.responses["Core_HotelBookings_by_pk"] = {
+        "Id": 41, "HotelName": "Someone Else's Hotel",
+        "OrganizationId": "11111111-2222-3333-4444-555555555555"}
+    assert await srv.get_hotel_booking(organizationId=ORG, currency="USD",
+                                       nationality="AE", Id=41) is None
+
+
+@pytest.mark.asyncio
+async def test_get_hotel_booking_returns_its_own_orgs_row(fake_hasura):
+    fake_hasura.responses["Core_HotelBookings_by_pk"] = {
+        "Id": 42, "HotelName": "Central Inn", "OrganizationId": ORG}
+    out = await srv.get_hotel_booking(organizationId=ORG, currency="USD",
+                                      nationality="AE", Id=42)
+    assert out is not None and out.HotelName == "Central Inn"

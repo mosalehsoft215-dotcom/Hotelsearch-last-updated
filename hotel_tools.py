@@ -481,7 +481,17 @@ async def get_hotel_booking(organizationId: str, currency: str, nationality: str
     with log_tool_call("get_hotel_booking", args={"Id": Id, "organizationId": organizationId},
                        organization_id=organizationId, currency=currency, nationality=nationality):
         row = await _request(_Q_BOOKING_BY_PK, {"Id": Id}, "Core_HotelBookings_by_pk")
-        return None if row is None else Core_HotelBookings.model_validate(row)
+        if row is None:
+            return None
+        # _by_pk takes only the primary key, and admin_secret bypasses Hasura's
+        # row permissions — so a bare numeric Id read any tenant's booking.
+        # Every other read here is org-scoped in the query; this one cannot be,
+        # so it is scoped on the way out.
+        if row.get("OrganizationId") not in (None, organizationId):
+            logger.warning("hotels_booking_cross_tenant_blocked",
+                           extra={"hotels": {"Id": Id, "organizationId": organizationId}})
+            return None
+        return Core_HotelBookings.model_validate(row)
 
 
 @mcp.tool()

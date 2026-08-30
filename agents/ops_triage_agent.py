@@ -24,6 +24,7 @@ MEM_SEEN_PATTERNS = "seen_patterns"
 MEM_LAST_REPORT = "last_report"
 MEM_RUN_COUNT = "run_count"
 MEM_CLASS_COUNTS = "classification_counts"
+MEM_COUNTED_IDS = "counted_message_ids"
 
 CLASSIFICATIONS = ("supplier_timeout", "validation_error", "pnr_conflict",
                    "payment_failure", "unknown")
@@ -96,11 +97,22 @@ For each distinct failure signature call record_ops_pattern with "operation:clas
     def on_run_start(self, ctx: AgentContext) -> None:
         ctx.remember(MEM_RUN_COUNT, (ctx.recall(MEM_RUN_COUNT) or 0) + 1)
         ctx.remember(MEM_CLASS_COUNTS, {})   # per-run tally; seen_patterns persists across runs
+        ctx.remember(MEM_COUNTED_IDS, [])    # per-run, so a later run counts afresh
 
     def on_run_end(self, ctx: AgentContext, output: str) -> None:
         ctx.remember(MEM_LAST_REPORT, output)
 
     def _record_failure(self, ctx: AgentContext, message: dict) -> None:
+        # The prescribed flow reads each failure twice — once from
+        # get_failed_messages and again from run_named_query('triage_context')
+        # — so one message was tallied as two and the report doubled its counts.
+        message_id = message.get("MessageId")
+        if message_id:
+            counted = list(ctx.recall(MEM_COUNTED_IDS) or [])
+            if message_id in counted:
+                return
+            counted.append(message_id)
+            ctx.remember(MEM_COUNTED_IDS, counted)
         cls = classify_error(message.get("ErrorMessage"))
         counts = dict(ctx.recall(MEM_CLASS_COUNTS) or {})
         counts[cls] = counts.get(cls, 0) + 1

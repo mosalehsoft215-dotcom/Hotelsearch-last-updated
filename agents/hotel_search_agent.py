@@ -64,6 +64,49 @@ _PROMISED_MEMORY = re.compile(
     r"|\bremembered (?:that|your)\b", re.I)
 
 
+# Tools that return supplier prices. A figure in the answer has to have come
+# from one of these; the prompt already forbids calculating prices.
+_PRICED_TOOLS = frozenset({
+    "search_hotel_availability", "get_hotel_search_results",
+    "get_hotel_availability_options", "get_hotel_options", "refresh_hotel_price"})
+
+# A money figure as written in an answer, either order, capturing the number.
+_QUOTED_MONEY = re.compile(
+    r"(?:[$€£]\s?|(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR)\s+)(\d[\d,]*(?:\.\d+)?)"
+    r"|(\d[\d,]*(?:\.\d+)?)\s?(?:[$€£]|(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR))", re.I)
+
+
+def _forms(number: float) -> set[str]:
+    """The spellings one price can take: 125.51, 125.5, 126."""
+    return {f"{number:.2f}", f"{number:g}", f"{round(number)}"}
+
+
+def _numbers_in(value: object) -> set[str]:
+    """Every number a tool returned, at any depth, in every spelling."""
+    found: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for item in node.values():
+                walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+        elif isinstance(node, bool):
+            return
+        elif isinstance(node, (int, float)):
+            found.update(_forms(float(node)))
+        elif isinstance(node, str):
+            for match in re.findall(r"\d[\d,]*(?:\.\d+)?", node):
+                try:
+                    found.update(_forms(float(match.replace(",", ""))))
+                except ValueError:
+                    pass
+
+    walk(value)
+    return found
+
+
 def _mentions_money(result: object) -> bool:
     """A web claim that quotes a price is out of scope — the supplier owns those."""
     if not isinstance(result, dict):
@@ -196,6 +239,32 @@ Apply what is already known above without being asked again, and say which prefe
         if _PROMISED_MEMORY.search(answer) and "remember_preference" not in called:
             result.add_issue("answer says a preference was remembered, but "
                              "remember_preference was never called")
+
+        # Until now verify() read the wording and the tool names but never
+        # compared them. A search returning only "Real Hotel" and an answer
+        # saying "Fiction Hotel costs $999" passed with zero issues: the tool
+        # was allowed, the org matched, nothing said "typical". Prices are the
+        # checkable part — the prompt forbids calculating them, so every figure
+        # in the answer should be one a tool returned.
+        priced_calls = [c for c in ctx.tool_calls if c.name in _PRICED_TOOLS]
+        if priced_calls and answer.strip():
+            known: set[str] = set()
+            for call in priced_calls:
+                known |= _numbers_in(call.result)
+            invented = []
+            for match in _QUOTED_MONEY.finditer(answer):
+                raw = (match.group(1) or match.group(2) or "").replace(",", "")
+                try:
+                    value = float(raw)
+                except ValueError:
+                    continue
+                if not (_forms(value) & known):
+                    invented.append(match.group(0).strip())
+            if invented:
+                result.add_issue(
+                    "answer quotes prices no tool returned: "
+                    + ", ".join(sorted(set(invented))[:5])
+                    + ". Every figure must come from the supplier tools")
 
         if "refresh_hotel_price" in called:
             if not ctx.recall(MEM_OPTION_REF):

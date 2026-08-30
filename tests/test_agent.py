@@ -377,7 +377,11 @@ async def test_failed_reprice_reported_honestly_passes():
     call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
                     {"error": "supplier timeout"})
     a.on_tool_result(ctx, call)
-    ctx.tool_calls = [call]
+    # The price it reports came from the search earlier in the session, which is
+    # still in ctx.tool_calls — that is what makes reporting it honest.
+    ctx.tool_calls = [ToolCall("get_hotel_options", {"organizationId": ORG},
+                               {"options": [{"price": {"totalPrice": 150.92,
+                                                       "currency": "USD"}}]}), call]
     a.on_run_end(ctx, "The live rate could not be confirmed. The last price I saw "
                       "was $150.92, which is not confirmed.")
     result = await a.verify(ctx)
@@ -461,10 +465,10 @@ async def test_402_retry_uses_the_budget_openrouter_named():
 
 
 @pytest.mark.asyncio
-async def test_429_on_a_free_name_retries_the_other_spelling():
-    """z-ai/glm-5.2:free answers 429 while z-ai/glm-5.2 answers 200."""
+async def test_a_naming_404_retries_the_other_spelling():
+    """z-ai/glm-5.2:free is not published; z-ai/glm-5.2 is."""
     transport, seen = _status_transport([
-        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (404, {"error": {"message": "no such model", "code": 404}}),
         (200, {"choices": [{"message": {"content": "ok"}}]}),
     ])
     llm = OpenRouterLLM(api_key="k", model="z-ai/glm-5.2:free", transport=transport)
@@ -476,7 +480,7 @@ async def test_429_on_a_free_name_retries_the_other_spelling():
 
 @pytest.mark.asyncio
 async def test_the_spelling_flip_happens_only_once():
-    transport, seen = _status_transport([(429, {"error": {"message": "rate", "code": 429}})])
+    transport, seen = _status_transport([(404, {"error": {"message": "no such model"}})])
     llm = OpenRouterLLM(api_key="k", model="a/b:free", transport=transport)
     with pytest.raises(LLMError):
         await llm.complete([{"role": "user", "content": "hi"}])
@@ -485,11 +489,11 @@ async def test_the_spelling_flip_happens_only_once():
 
 @pytest.mark.asyncio
 async def test_a_spelling_flip_does_not_consume_the_budget_retry():
-    """Gating the budget retry on attempt==0 meant a 429 flip on the first
+    """Gating the budget retry on attempt==0 meant a spelling flip on the first
     attempt spent its only chance, so the 402 that followed was raised with the
     original 4000 still in it and no retry ever happened."""
     transport, seen = _status_transport([
-        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (404, {"error": {"message": "no such model"}}),
         (402, _AFFORD),
         (200, {"choices": [{"message": {"content": "ok"}}]}),
     ])
@@ -598,11 +602,10 @@ async def test_an_empty_triage_report_fails_verification():
 
 @pytest.mark.asyncio
 async def test_a_flip_that_lands_nowhere_reports_the_original_failure():
-    """inclusionai/ling-3.0-flash-fin exists only as :free. A 429 on the :free
-    name flipped to the bare one, which 404s — so a transient rate limit was
-    reported as "No endpoints found for <a name nobody configured>"."""
+    """A naming 404 on one spelling flipped to the other, which also 404s — so
+    the failure was reported against a name nobody configured."""
     transport, seen = _status_transport([
-        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (404, {"error": {"message": "no such model", "code": 404}}),
         (404, {"error": {"message": "No endpoints found for inclusionai/ling-3.0-flash-fin."}}),
     ])
     llm = OpenRouterLLM(api_key="k", model="inclusionai/ling-3.0-flash-fin:free",
@@ -610,7 +613,7 @@ async def test_a_flip_that_lands_nowhere_reports_the_original_failure():
     with pytest.raises(LLMError) as exc:
         await llm.complete([{"role": "user", "content": "hi"}])
     message = str(exc.value)
-    assert "429" in message, "the rate limit is what went wrong"
+    assert "404" in message and "no such model" in message
     assert "inclusionai/ling-3.0-flash-fin:free" in message, "and it names the configured model"
     assert "No endpoints found" not in message
     assert llm.model == "inclusionai/ling-3.0-flash-fin:free", "the name is restored"
@@ -646,3 +649,98 @@ async def test_provider_tool_call_fields_survive_the_round_trip():
     res = await HotelSearchAgent().run(ctx, "find hotels", llm2, max_iterations=3)
     echoed = next(m for m in res.messages if m.get("tool_calls"))
     assert echoed["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "EukCCuYCARFNMg"
+
+
+@pytest.mark.asyncio
+async def test_a_503_is_retried_not_surfaced_as_a_dead_end():
+    """Google answers 503 "experiencing high demand" and clears on retry; the
+    client stopped after one attempt and reported it as final."""
+    import runtime
+    transport, seen = _status_transport([
+        (503, {"error": {"code": 503, "message": "This model is currently experiencing high demand."}}),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    runtime._BACKOFF = (0.0, 0.0)
+    llm = OpenRouterLLM(api_key="k", model="gemini-flash-latest",
+                        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                        transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert len(seen["sent"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_errors_name_the_host_that_answered():
+    """Four providers share this client; "OpenRouter HTTP 503" was wrong for
+    three of them and sent people to the wrong dashboard."""
+    transport, _ = _status_transport([(400, {"error": {"message": "bad request"}})])
+    llm = OpenRouterLLM(api_key="k", model="gpt-4o-mini",
+                        base_url="https://api.openai.com/v1", transport=transport)
+    with pytest.raises(LLMError) as exc:
+        await llm.complete([{"role": "user", "content": "hi"}])
+    assert "api.openai.com" in str(exc.value)
+    assert "OpenRouter" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_no_longer_flips_a_free_name_to_its_paid_twin():
+    """429 is a capacity problem, not a naming one. Flipping :free off could
+    land on the paid model; it is retried on the same name instead."""
+    import runtime
+    runtime._BACKOFF = (0.0, 0.0)
+    transport, seen = _status_transport([
+        (429, {"error": {"message": "Rate limit exceeded: free-models-per-day"}}),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="inclusionai/ling-3.0-flash-fin:free",
+                        transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert [m["model"] for m in seen["sent"]] == [
+        "inclusionai/ling-3.0-flash-fin:free"] * 2, "same name both times"
+    assert llm.model == "inclusionai/ling-3.0-flash-fin:free"
+
+
+# ---------------------------------------------------------------------------
+# verify() read the wording and the tool names but never compared them, so a
+# search returning "Real Hotel" and an answer saying "Fiction Hotel costs $999"
+# passed with zero issues.
+# ---------------------------------------------------------------------------
+
+def _search_call(name="Real Hotel", total=125.51):
+    return ToolCall("search_hotel_availability", {"organizationId": ORG, "city": "Jeddah"},
+                    {"uuid": "U1", "nights": 3,
+                     "hotels": [{"hotelName": name, "hotelCode": "1442211",
+                                 "pricePerNight": 41.84,
+                                 "price": {"totalPrice": total, "currency": "USD"}}]})
+
+
+@pytest.mark.asyncio
+async def test_a_price_no_tool_returned_fails_verification():
+    result = await _verify("Fiction Hotel costs $999 USD total for your stay.",
+                           [_search_call()])
+    assert not result.passed
+    assert any("quotes prices no tool returned" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_prices_the_tool_did_return_pass():
+    result = await _verify(
+        "Real Hotel — $41.84 per night, $125.51 total for 3 nights.", [_search_call()])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_rounded_and_comma_spellings_of_a_real_price_pass():
+    result = await _verify("Real Hotel is about $126 total.", [_search_call()])
+    assert result.passed, result.issues
+    big = await _verify("Suite is $1,250.00 total.", [_search_call(total=1250.0)])
+    assert big.passed, big.issues
+
+
+@pytest.mark.asyncio
+async def test_the_price_check_is_silent_without_a_priced_tool():
+    """An enrichment-only turn quotes no supplier prices and must not be graded
+    against a search that never ran."""
+    result = await _verify("It will be hot and dry.", [_enriched()])
+    assert result.passed, result.issues
