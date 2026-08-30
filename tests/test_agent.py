@@ -226,6 +226,7 @@ async def test_verify_clean_run():
     ]
     for c in ctx.tool_calls:
         a.on_tool_result(ctx, c)
+    a.on_run_end(ctx, "Confirmed price: $340.00 USD total for the Alpha Hotel.")
     res = await a.verify(ctx)
     assert res.passed, res.issues
 
@@ -532,3 +533,64 @@ async def test_the_free_flip_is_openrouter_only():
     assert "tool calling" in str(exc.value)
     assert len(seen["sent"]) == 1, "no flip off OpenRouter"
     assert llm.model == "groq/compound"
+
+
+# ---------------------------------------------------------------------------
+# Stopping is not answering. Models that reason in a separate field return
+# content="" and put everything there; the turn then ended on "(no reply)" with
+# the tools already called and the badge still green.
+# ---------------------------------------------------------------------------
+
+class _Scripted:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def complete(self, messages, tools=None):
+        self.calls.append({"tools_offered": len(tools or []),
+                           "last_role": messages[-1]["role"]})
+        return self._responses.pop(0)
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_an_empty_final_message_is_not_accepted_as_the_answer():
+    from runtime import LLMResponse
+    llm = _Scripted([
+        LLMResponse(content=""),                      # stops, writes nothing
+        LLMResponse(content="Here are the 5 cheapest hotels."),   # forced answer
+    ])
+    ctx = _ctx()
+    res = await HotelSearchAgent().run(ctx, "find hotels", llm, max_iterations=4)
+    assert res.output == "Here are the 5 cheapest hotels."
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["tools_offered"] == 0, "the forced answer must not offer tools"
+    assert [m["role"] for m in res.messages][-2:] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_a_whitespace_only_answer_counts_as_empty():
+    from runtime import LLMResponse
+    llm = _Scripted([LLMResponse(content="   \n  "), LLMResponse(content="Real answer.")])
+    res = await HotelSearchAgent().run(_ctx(), "find hotels", llm, max_iterations=4)
+    assert res.output == "Real answer."
+
+
+@pytest.mark.asyncio
+async def test_an_empty_answer_fails_verification():
+    result = await _verify("", [ToolCall("search_hotel_availability", {"organizationId": ORG}, {})])
+    assert not result.passed
+    assert any("no written answer" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_triage_report_fails_verification():
+    from agents.ops_triage_agent import OpsTriageAgent
+    a, ctx = OpsTriageAgent(), AgentContext(org_id=ORG)
+    a.on_run_start(ctx)
+    a.on_run_end(ctx, "")
+    result = await a.verify(ctx)
+    assert not result.passed
+    assert any("no written report" in i for i in result.issues)

@@ -174,6 +174,11 @@ Apply what is already known above without being asked again, and say which prefe
         answer = ctx.recall(MEM_ANSWER) or ""
         called = {c.name for c in ctx.tool_calls}
 
+        # "(no reply)" under a green badge is the worst of both: nothing was
+        # said, and the page reports it as checked.
+        if not answer.strip():
+            result.add_issue("the run produced no written answer")
+
         # An estimate is only a fault when enrichment was asked and came up
         # short. A plain search may say "check-in is typically 15:00".
         if called & _ENRICHMENT_TOOLS:

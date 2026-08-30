@@ -271,7 +271,9 @@ async def test_verify_is_happy_with_ordinary_claims():
     ctx.tool_calls = [ToolCall("enrich_destination", {"city": "Jeddah"},
                                {"domains": {"weather": {"findings": {
                                    "forecast_2026-09-01": [{"value": "29–38°C, 0 mm rain"}]}}}})]
-    assert (await HotelSearchAgent().verify(ctx)).passed
+    agent = HotelSearchAgent()
+    agent.on_run_end(ctx, "The forecast for 1 September is 29-38 C with no rain.")
+    assert (await agent.verify(ctx)).passed
 
 
 # ---------------------------------------------------------------------------

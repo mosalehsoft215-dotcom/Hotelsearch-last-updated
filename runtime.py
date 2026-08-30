@@ -604,12 +604,18 @@ class AgentBase(ABC):
         for _ in range(max_iterations):
             resp = await llm.complete(messages, tools=specs)
             if not resp.tool_calls:
-                output = resp.content or ""
-                # The answer has to go into `messages` too. `messages` becomes the
-                # session history, so leaving it out meant the next turn saw two
-                # consecutive user turns and no record of what the agent had said —
-                # "which one was cheapest?" had nothing to refer back to.
-                messages.append({"role": "assistant", "content": output})
+                # Stopping is not the same as answering. Models that reason in a
+                # separate field return content="" and put everything there, so
+                # taking the empty string ended the turn on "(no reply)" — with
+                # the tools already called and the badge still green. Leave
+                # `output` unset and let the fallback below ask for words.
+                if (resp.content or "").strip():
+                    output = resp.content
+                    # The answer has to go into `messages` too. `messages` becomes
+                    # the session history, so leaving it out meant the next turn saw
+                    # two consecutive user turns and no record of what the agent had
+                    # said — "which one was cheapest?" had nothing to refer back to.
+                    messages.append({"role": "assistant", "content": output})
                 break
             messages.append({
                 "role": "assistant", "content": resp.content or "",
@@ -631,8 +637,9 @@ class AgentBase(ABC):
                     "content": json.dumps(result, default=str),
                 })
         if output is None:
-            # Hit the tool-call cap without a written answer. Force one from what
-            # was gathered so the user gets a real reply, never a dead end.
+            # Either the tool-call cap was hit, or the model stopped without
+            # writing anything. Force an answer from what was gathered so the
+            # user gets a real reply, never a dead end.
             messages.append({"role": "user", "content":
                 "Give your final answer now using the information you already have. "
                 "Do not call any tools. If no priced hotels were found, say so and "

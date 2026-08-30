@@ -135,6 +135,8 @@ For each distinct failure signature call record_ops_pattern with "operation:clas
         for call in ctx.tool_calls:
             if call.name not in ALLOWED_TOOLS:
                 result.add_issue(f"called tool outside the ops read set: {call.name}")
+        if not (ctx.recall(MEM_LAST_REPORT) or "").strip():
+            result.add_issue("the run produced no written report")
         classified = sum((ctx.recall(MEM_CLASS_COUNTS) or {}).values())
         for issue in check_report_is_actionable(ctx.recall(MEM_LAST_REPORT), classified):
             result.add_issue(issue)
