@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     openrouter_api_key_b: str | None = Field(default=None, alias="OPENROUTER_API_KEY_B")
     openrouter_model_c: str | None = Field(default=None, alias="OPENROUTER_MODEL_C")
     openrouter_api_key_c: str | None = Field(default=None, alias="OPENROUTER_API_KEY_C")
+    openrouter_model_d: str | None = Field(default=None, alias="OPENROUTER_MODEL_D")
+    openrouter_api_key_d: str | None = Field(default=None, alias="OPENROUTER_API_KEY_D")
+    openrouter_model_e: str | None = Field(default=None, alias="OPENROUTER_MODEL_E")
+    openrouter_api_key_e: str | None = Field(default=None, alias="OPENROUTER_API_KEY_E")
 
     llm_provider: Literal["openrouter"] = Field(default="openrouter", alias="LLM_PROVIDER")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
@@ -89,7 +93,9 @@ class Settings(BaseSettings):
         """The models the chat page offers, first one being the default."""
         pairs = [(self.openrouter_model, self.openrouter_api_key),
                  (self.openrouter_model_b, self.openrouter_api_key_b),
-                 (self.openrouter_model_c, self.openrouter_api_key_c)]
+                 (self.openrouter_model_c, self.openrouter_api_key_c),
+                 (self.openrouter_model_d, self.openrouter_api_key_d),
+                 (self.openrouter_model_e, self.openrouter_api_key_e)]
         return [{"model": m, "api_key": k} for m, k in pairs if m and k]
 
     def credentials_for(self, model: str | None) -> tuple[str, str | None]:

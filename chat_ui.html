@@ -209,6 +209,17 @@
      crash; it is one dropdown away from working, so say that instead. */
   function readable(err){
     const raw = String(err || "");
+    // Checked before the credit rule below, which it would otherwise match.
+    // OpenRouter caps how many requests one key may have in flight at once and
+    // reports going over it as a 402 whose message says "credits" — but the
+    // balance is fine and the same call succeeds on retry. Reading it as an
+    // empty account sends you to a second key that has the same cap.
+    if(/in.?flight/i.test(raw))
+      return "Too many requests in flight on this key. Wait about two minutes and send again — the model and the key are both fine.";
+    // The prompt alone is over the balance, so trimming max_tokens cannot help
+    // and the client's budget retry has nothing to give back.
+    if(/prompt tokens limit exceeded/i.test(raw))
+      return "This model's key can't cover a request this size — the system prompt and tool list alone exceed its balance. Pick another model from the dropdown above.";
     if(/\b402\b|credit|can only afford/i.test(raw))
       return "This model's key has no credit left. Pick another model from the dropdown above — the rest of the session is unaffected.";
     if(/\b(401|403)\b|unauthor/i.test(raw))

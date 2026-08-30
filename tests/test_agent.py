@@ -422,3 +422,80 @@ async def test_promised_memory_with_the_tool_passes():
                                      {"statement": "4-star or better", "key": "hotel_stars"},
                                      {"stored": True})])
     assert result.passed, result.issues
+
+
+def _status_transport(script):
+    """Replies in order; each entry is (status, body)."""
+    seen = {"n": 0, "sent": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["sent"].append(json.loads(request.content.decode()))
+        status, body = script[min(seen["n"], len(script) - 1)]
+        seen["n"] += 1
+        return httpx.Response(status, json=body)
+
+    return httpx.MockTransport(handler), seen
+
+
+_AFFORD = {"error": {"message": "This request requires more credits, or fewer "
+                                "max_tokens. You requested up to 4000 tokens, but "
+                                "can only afford 46.", "code": 402}}
+
+
+@pytest.mark.asyncio
+async def test_402_retry_uses_the_budget_openrouter_named():
+    """The old floor of 256 guaranteed a second 402 whenever the affordable
+    budget was below it, so the documented self-heal never ran on a nearly
+    drained key — and the page called it "no credit left"."""
+    transport, seen = _status_transport([
+        (402, _AFFORD),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="z-ai/glm-5.2", max_tokens=4000,
+                        transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert seen["sent"][0]["max_tokens"] == 4000
+    assert seen["sent"][1]["max_tokens"] == 38, "must fit inside the 46 it named"
+
+
+@pytest.mark.asyncio
+async def test_429_on_a_free_name_retries_the_other_spelling():
+    """z-ai/glm-5.2:free answers 429 while z-ai/glm-5.2 answers 200."""
+    transport, seen = _status_transport([
+        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="z-ai/glm-5.2:free", transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert [m["model"] for m in seen["sent"]] == ["z-ai/glm-5.2:free", "z-ai/glm-5.2"]
+    assert llm.model == "z-ai/glm-5.2"
+
+
+@pytest.mark.asyncio
+async def test_the_spelling_flip_happens_only_once():
+    transport, seen = _status_transport([(429, {"error": {"message": "rate", "code": 429}})])
+    llm = OpenRouterLLM(api_key="k", model="a/b:free", transport=transport)
+    with pytest.raises(LLMError):
+        await llm.complete([{"role": "user", "content": "hi"}])
+    assert len(seen["sent"]) == 2, "one flip, then it gives up rather than looping"
+
+
+@pytest.mark.asyncio
+async def test_a_spelling_flip_does_not_consume_the_budget_retry():
+    """Gating the budget retry on attempt==0 meant a 429 flip on the first
+    attempt spent its only chance, so the 402 that followed was raised with the
+    original 4000 still in it and no retry ever happened."""
+    transport, seen = _status_transport([
+        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (402, _AFFORD),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="poolside/laguna-s-2.1:free",
+                        max_tokens=4000, transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert [m["model"] for m in seen["sent"]] == [
+        "poolside/laguna-s-2.1:free", "poolside/laguna-s-2.1", "poolside/laguna-s-2.1"]
+    assert [m["max_tokens"] for m in seen["sent"]] == [4000, 4000, 38]

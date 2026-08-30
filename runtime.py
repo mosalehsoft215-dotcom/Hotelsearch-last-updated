@@ -132,7 +132,13 @@ class OpenRouterLLM:
         # One retry: OpenRouter returns 402 with "can only afford N tokens" when the
         # request's max_tokens exceeds the caller's credit balance. Parse N and retry
         # with that budget so the session self-heals as credits drain.
+        # Each recovery fires once, tracked by its own flag rather than by the
+        # attempt number. Gating the budget retry on `attempt == 0` meant a
+        # spelling flip on the first attempt used up its only chance, so a 402
+        # arriving second was raised untouched — which is how a key that could
+        # afford 527 reported "you requested up to 4000" and no retry at all.
         tried_other_spelling = False
+        tried_budget = False
         for attempt in range(3):
             body = dict(base)
             body["model"] = self.model
@@ -146,16 +152,28 @@ class OpenRouterLLM:
             except httpx.HTTPError as exc:
                 raise LLMError(f"OpenRouter request failed: {exc}") from exc
 
-            if resp.status_code == 402 and attempt == 0:
+            if resp.status_code == 402 and not tried_budget:
                 afford = re.search(r"can only afford (\d+)", resp.text)
                 if afford:
-                    self.max_tokens = max(256, int(afford.group(1)) - 64)
+                    tried_budget = True
+                    # Honour the number OpenRouter gave. The old floor of 256
+                    # guaranteed a second 402 whenever the affordable budget was
+                    # below it — measured on a key that could afford 46: the
+                    # retry asked for 256, was refused again, and the page said
+                    # "no credit left" about a key that answers fine at 38.
+                    self.max_tokens = max(16, int(afford.group(1)) - 8)
                     continue
 
-            # A name that is listed with :free on one account and without it on
-            # another comes back as "no such model". Try the other spelling once.
-            if (resp.status_code in (400, 404) and not tried_other_spelling
-                    and re.search(r"model", resp.text, re.I)):
+            # A name listed with :free on one account and without it on another
+            # comes back as "no such model". Separately, a :free name whose
+            # shared pool is saturated answers 429 while the plain spelling
+            # answers 200 — measured on z-ai/glm-5.2 — and the reverse holds for
+            # a paid name on an account with no credit. Try the other spelling
+            # once in either case; the flag stops it looping.
+            if not tried_other_spelling and (
+                    resp.status_code == 429
+                    or (resp.status_code in (400, 404)
+                        and re.search(r"model", resp.text, re.I))):
                 tried_other_spelling = True
                 self.model = free_variant(self.model)
                 continue
