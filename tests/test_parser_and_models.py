@@ -179,3 +179,21 @@ def test_a_slot_can_live_on_a_different_host():
     assert build_llm(settings, model="groq/compound").base_url == "https://api.groq.com/openai/v1"
     # The host travels with the slot; the key still pays only for its own model.
     assert settings.credentials_for("groq/compound") == ("groq/compound", "gsk_x")
+
+
+def test_slots_route_to_their_own_hosts_side_by_side():
+    """Three providers in one dropdown: OpenRouter by default, Groq and OpenAI
+    each on their own host, and every key still pays only for its own model."""
+    settings = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
+                        OPENROUTER_MODEL="anthropic/claude-haiku-4.5", OPENROUTER_API_KEY="key-a",
+                        OPENROUTER_MODEL_F="groq/compound", OPENROUTER_API_KEY_F="gsk_x",
+                        OPENROUTER_BASE_URL_F="https://api.groq.com/openai/v1",
+                        OPENROUTER_MODEL_H="gpt-4o-mini", OPENROUTER_API_KEY_H="sk-proj-x",
+                        OPENROUTER_BASE_URL_H="https://api.openai.com/v1")
+    assert [o["model"] for o in settings.model_options()] == [
+        "anthropic/claude-haiku-4.5", "groq/compound", "gpt-4o-mini"]
+    assert settings.base_url_for("gpt-4o-mini") == "https://api.openai.com/v1"
+    assert settings.base_url_for("groq/compound") == "https://api.groq.com/openai/v1"
+    assert settings.base_url_for("anthropic/claude-haiku-4.5") == settings.openrouter_base_url
+    assert settings.credentials_for("gpt-4o-mini") == ("gpt-4o-mini", "sk-proj-x")
+    assert build_llm(settings, model="gpt-4o-mini").base_url == "https://api.openai.com/v1"
