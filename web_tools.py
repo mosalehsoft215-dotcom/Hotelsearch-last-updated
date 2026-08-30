@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from config import get_settings
-from enrichment_index import MIN_SCORE, EnrichmentIndex
+from enrichment_index import MIN_SCORE, EnrichmentIndex, mentioned_entities
 from web_enrich import (
     DESTINATION_DOMAINS, DOMAINS, HOTEL_DOMAINS, Cache, Enricher, build_providers,
 )
@@ -57,6 +57,20 @@ async def enrich_destination(city: str, checkIn: str | None = None,
     }
 
 
+def _note(question: str, matches: list[dict[str, Any]]) -> str | None:
+    """Say which subject came up empty, not just that something did. Asking
+    about a city the index has never fetched used to return another city's
+    weather at 0.757, because the domain vocabulary matches whatever the
+    question is about."""
+    if matches:
+        return None
+    named = mentioned_entities(question)
+    if named:
+        return (f"nothing enriched so far covers {named[0]}. "
+                "Fetch it first with enrich_destination or enrich_hotel_info.")
+    return "nothing enriched so far answers this"
+
+
 async def search_enrichment(question: str, limit: int = 5, subject: str | None = None,
                             domain: str | None = None, entityType: str | None = None,
                             entityRef: str | None = None,
@@ -75,7 +89,7 @@ async def search_enrichment(question: str, limit: int = 5, subject: str | None =
         "question": question,
         "indexed_claims": _index.size(),
         "matches": matches,
-        "note": None if matches else "nothing enriched so far answers this",
+        "note": _note(question, matches),
         "min_score": MIN_SCORE if minScore is None else minScore,
         "usage": ("Claims already fetched from the web, each with its sources and "
                   "status. Same rules as when they were fetched: attribute them, and "

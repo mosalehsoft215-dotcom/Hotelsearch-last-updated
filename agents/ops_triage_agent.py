@@ -91,7 +91,9 @@ Start every triage with get_queue_summary() for overall queue health. Then call 
 
 Never suggest replaying or retrying a failed message — that decision belongs to a human.
 
-Output a structured triage report with: total counts by status, a table classifying each failure with its reason, and a recommended action per failure.{known}
+Output a structured triage report with: total counts by status, a table classifying each failure with its reason, and a recommended action per failure.
+
+Count only the messages you actually read. If you fetched 20 of 120, say "20 of 120 read" and give the counts for those 20 — never scale them up to the full queue. An extrapolated figure looks like a measurement and is not one: two runs over the same 20 messages produced "~110 supplier_timeout" and "~54 supplier_timeout" for the same queue. Name a supplier only when a message names it; a supplier code is a code, not a vendor name.{known}
 For each distinct failure signature call record_ops_pattern with "operation:classification". It tells you whether that signature was already seen in an earlier session — report those as known and recurring, and only call something new when it is new."""
 
     def on_run_start(self, ctx: AgentContext) -> None:

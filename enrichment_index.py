@@ -106,8 +106,40 @@ class IndexedClaim:
                 "observed_at": self.observed_at, "match": round(score, 3)}
 
 
+# Words that start with a capital in a question without naming a place.
+_NOT_A_PLACE = frozenset("""
+january february march april may june july august september october november
+december monday tuesday wednesday thursday friday saturday sunday what when
+where which how why who is are do does can could would will the a an my our
+i it there hotel hotels room rooms night nights price prices weather forecast
+""".split())
+
+_CAPITALISED = re.compile(r"([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)*)")
+
+
+def mentioned_entities(question: str) -> list[str]:
+    """Proper nouns a question names — the city or hotel it is asking about.
+
+    Cheap on purpose: capitalised runs, minus the words that start a sentence or
+    name a month. It only has to be good enough to notice that "the weather in
+    Aswan" is not a question about Jeddah.
+    """
+    found: list[str] = []
+    for phrase in _CAPITALISED.findall(question):
+        # "What's" is "what" with a contraction stuck to it, and "what" is in
+        # the list. Strip that before deciding, or every question beginning
+        # "What's ..." names a place called What's.
+        words = [w for w in phrase.split()
+                 if re.sub(r"'\w*$", "", w).lower() not in _NOT_A_PLACE]
+        if words:
+            found.append(" ".join(words))
+    return found
+
+
 class VectorStore(Protocol):
     def upsert(self, claims: Iterable[tuple[IndexedClaim, list[float]]]) -> int: ...
+
+    def entity_refs(self) -> set[str]: ...
 
     def nearest(self, vector: list[float], limit: int, subject: str | None,
                 domain: str | None, entity_type: str | None = None,
@@ -192,6 +224,12 @@ class SqliteVectorStore:
         # the agent then states as fact. One result is the floor.
         return [pair for pair in scored[:max(1, limit)] if pair[0] >= min_score]
 
+    def entity_refs(self) -> set[str]:
+        """Every entity the index holds, so a question can be checked against
+        what is actually stored rather than against a vocabulary."""
+        rows = self._db.execute("SELECT DISTINCT entity_ref FROM claims").fetchall()
+        return {r[0] for r in rows if r[0]}
+
     def count(self) -> int:
         return self._db.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
 
@@ -242,6 +280,20 @@ class EnrichmentIndex:
                min_score: float = MIN_SCORE) -> list[dict[str, Any]]:
         if not question.strip():
             return []
+        # expand() puts a whole domain vocabulary on both sides, which is what
+        # lets "how warm will it be" reach "29.2-34.5°C" — and also what made
+        # "the weather in Aswan" score 0.757 against Jeddah. The floor separates
+        # on-domain from off-domain; it cannot separate one city from another.
+        # The names the question uses can.
+        if entity_ref is None:
+            named = mentioned_entities(question)
+            if named:
+                known = {ref.lower(): ref for ref in self.store.entity_refs()}
+                matched = [known[n.lower()] for n in named if n.lower() in known]
+                if matched:
+                    entity_ref = matched[0]
+                else:
+                    return []      # asked about something this index has never seen
         hits = self.store.nearest(embed_text(expand(question, domain)), limit, subject,
                                   domain, entity_type, entity_ref, min_score)
         return [claim.to_model(score) for score, claim in hits]

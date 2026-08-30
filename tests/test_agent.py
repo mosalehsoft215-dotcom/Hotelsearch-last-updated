@@ -744,3 +744,30 @@ async def test_the_price_check_is_silent_without_a_priced_tool():
     against a search that never ran."""
     result = await _verify("It will be hot and dry.", [_enriched()])
     assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_carrying_one_windows_numbers_to_another_fails_verification():
+    """Live: a forecast covering 10-13 September, answered with "Expect
+    similarly hot, dry weather for your Sep 1-2 dates" — verified green."""
+    result = await _verify(
+        "The forecast covers Sep 10-13. Expect similarly hot, dry weather for "
+        "your Sep 1-2 dates.", [_enriched()])
+    assert not result.passed
+    assert any("estimates rather than reports" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_reporting_the_window_it_actually_covers_passes():
+    result = await _verify(
+        "The forecast covers Sep 10-13 at 28.5-35.1 C with no rain. It does not "
+        "cover Sep 1-2, so I have no data for your dates.", [_enriched()])
+    assert result.passed, result.issues
+
+
+def test_the_prompt_refuses_to_invent_dates():
+    """"Next month" was answered with a search for Sep 1 to Sep 2 — a one-night
+    stay nobody asked for, which made every price in that demo wrong."""
+    prompt = HotelSearchAgent().build_prompt(_ctx())
+    assert "Dates do not" in prompt
+    assert "do not assume one night" in prompt

@@ -42,7 +42,13 @@ _ESTIMATED = re.compile(
     r"\btypical(?:ly)?\b|\busually\b|\bon average\b|\bgenerally\b|\bin general\b"
     r"|\bi'?d expect\b|\byou can expect\b|\bshould be (?:around|about)\b"
     r"|\bbased on the (?:typical|usual|historical|general|seasonal)\b"
-    r"|\b(?:seasonal|historical) (?:average|pattern|norm)s?\b", re.I)
+    r"|\b(?:seasonal|historical) (?:average|pattern|norm)s?\b"
+    # Carrying one window's numbers over to another is the same invention with
+    # softer words. Seen live: a forecast covering 10-13 September answered with
+    # "Expect similarly hot, dry weather for your Sep 1-2 dates", verified green.
+    r"|\bexpect similar(?:ly)?\b|\bsimilar(?:ly)? (?:hot|warm|cold|cool|wet|dry|mild)\b"
+    r"|\b(?:should be|will be|likely) similar\b|\bcomparable (?:to|temperatures|conditions)\b"
+    r"|\bin line with\b|\bmuch the same\b", re.I)
 
 # Seen live two lines apart: "there's a technical issue with the live rate
 # confirmation tool", then "Confirmed Price: $150.92 USD total", verified green.
@@ -133,7 +139,9 @@ Organization ID: {ctx.org_id}. It is attached to every tool call automatically. 
 
 Today is {date.today().isoformat()}. Resolve relative dates from today, and always pass full YYYY-MM-DD dates with the correct year — never a past date.
 
-From the request, work out: city, check-in date, check-out date, number of rooms, adults per room, children per room with ages, and any limits the user gave — a budget or price range, a star rating, or amenities they want. If rooms or guests are not given, use 1 room and 2 adults. Get the number of nights from the two dates. If the city name is ambiguous and the search returns more than one matching place, ask the user which one before continuing.
+From the request, work out: city, check-in date, check-out date, number of rooms, adults per room, children per room with ages, and any limits the user gave — a budget or price range, a star rating, or amenities they want. If rooms or guests are not given, use 1 room and 2 adults. Get the number of nights from the two dates.
+
+Rooms and guests have a sensible default. Dates do not. "Next month", "in September", "sometime soon" name no check-in and no length of stay, so ask for both before searching — do not pick a date and do not assume one night. Every price you show is for the nights you searched, so a stay nobody asked for makes the whole answer wrong. If the city name is ambiguous and the search returns more than one matching place, ask the user which one before continuing.
 
 Pass the user's limits to search_hotel_availability as filters: minPrice/maxPrice for a budget, minStars/maxStars for a star rating, amenities for things like wifi or a pool. Sort with sortField (PRICE, RATING or RECOMMENDED — RATING is the star rating, there is no STARS value) and sortOrder (asc or desc); default to cheapest first. If the user narrows or re-orders an existing search, call get_hotel_search_results with the same uuid and the new filters instead of searching again. When the result says hasMorePages, you can ask for the next pageNumber.
 

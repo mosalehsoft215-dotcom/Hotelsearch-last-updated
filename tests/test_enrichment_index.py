@@ -252,3 +252,50 @@ def test_real_matches_sit_far_above_the_floor():
     assert real[0]["match"] > MIN_SCORE * 2, real[0]["match"]
     noise = _weather_index().search("is it muggy", min_score=0.0)
     assert noise[0]["match"] < MIN_SCORE, noise[0]["match"]
+
+
+# ---------------------------------------------------------------------------
+# expand() puts a whole domain vocabulary on both sides, which is what lets
+# "how warm will it be" reach "29.2-34.5°C" — and also what made "the weather in
+# Aswan" score 0.757 against Jeddah. The floor cannot separate one city from
+# another; the names in the question can.
+# ---------------------------------------------------------------------------
+from enrichment_index import mentioned_entities
+
+
+def _jeddah_weather():
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(Enrichment(subject="Jeddah", domain="weather", entity_type="city",
+                         entity_ref="Jeddah",
+                         claims=[claim("forecast_2026-09-11", "29.1–35°C, 0 mm rain",
+                                       url="https://api.open-meteo.com/x", domain="weather")]))
+    return index
+
+
+def test_a_question_about_an_unknown_city_returns_nothing():
+    assert _jeddah_weather().search("What's the weather in Aswan?") == []
+
+
+def test_a_question_naming_the_known_city_still_answers():
+    assert _jeddah_weather().search("What is the weather in Jeddah?")
+
+
+def test_a_question_naming_no_city_is_unchanged():
+    """The demo's own phrasing — this is the retrieval the panel shows."""
+    assert _jeddah_weather().search("how warm will it be")
+    assert _jeddah_weather().search("will it rain")
+
+
+def test_months_and_openers_are_not_read_as_places():
+    assert mentioned_entities("What about September?") == []
+    assert mentioned_entities("How warm will it be on Monday?") == []
+    assert mentioned_entities("What's the weather in Aswan?") == ["Aswan"]
+
+
+@pytest.mark.asyncio
+async def test_the_note_names_the_subject_that_is_missing(monkeypatch):
+    import web_tools
+    monkeypatch.setattr(web_tools, "_index", _jeddah_weather())
+    out = await web_tools.search_enrichment("What's the weather in Aswan?")
+    assert out["matches"] == []
+    assert "Aswan" in out["note"]

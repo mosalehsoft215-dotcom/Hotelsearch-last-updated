@@ -150,3 +150,15 @@ def test_report_actionable_check():
         "report is missing a recommended action"]
     # nothing classified -> nothing to check
     assert check_report_is_actionable("anything", classified_count=0) == []
+
+
+def test_the_prompt_forbids_extrapolated_counts():
+    """Two handovers over the same 20 sampled messages reported "~110
+    supplier_timeout" and "~54 supplier_timeout" for the same queue, both
+    labelled "est." — a fabricated number wearing a measurement's clothes."""
+    from agents.ops_triage_agent import OpsTriageAgent
+    from runtime import AgentContext
+    prompt = OpsTriageAgent().build_prompt(AgentContext(org_id="org-1"))
+    assert "Count only the messages you actually read" in prompt
+    assert "never scale them up" in prompt
+    assert "a supplier code is a code, not a vendor name" in prompt.lower()
