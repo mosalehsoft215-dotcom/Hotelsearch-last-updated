@@ -405,6 +405,22 @@ class OpenMeteo:
                 value=f"{low:g}–{high:g}°C, {wet:g} mm rain" if wet is not None
                       else f"{low:g}–{high:g}°C",
                 sources=[source]))
+
+        # The forecast can answer for dates nobody asked about — a stay in
+        # September against a window that starts today, because the API only
+        # reaches so far ahead. Left unsaid, the model notices the mismatch and
+        # fills the gap with "typical early September patterns": invented
+        # numbers, different on each run, under a passing verification. Say it
+        # as a claim instead, with the same source as the rest, so it reaches
+        # the agent and the index like any other fact.
+        asked_from = context.get("check_in")
+        if asked_from and asked_from not in days:
+            asked_to = context.get("check_out") or asked_from
+            claims.append(Claim(
+                domain=domain, field_name="coverage_gap", provider=self.name,
+                value=(f"asked for {asked_from} to {asked_to}; the forecast returned "
+                       f"{days[0]} to {days[-1]}. There is no data for the dates requested."),
+                sources=[source]))
         return claims
 
 

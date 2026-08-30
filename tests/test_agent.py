@@ -289,3 +289,136 @@ def test_the_agent_can_still_reach_search_enrichment():
     from agents.hotel_search_agent import ALLOWED_TOOLS
     assert "search_enrichment" in ALLOWED_TOOLS
     assert "book_hotel" not in ALLOWED_TOOLS and "cancel_hotel" not in ALLOWED_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# verify() reads the answer, not just the tool calls. Every fault below was
+# produced by a running agent and passed with a green badge before these ran.
+# ---------------------------------------------------------------------------
+from agents.hotel_search_agent import MEM_ANSWER
+
+
+async def _verify(answer, tool_calls, memory=None):
+    a, ctx = HotelSearchAgent(), _ctx()
+    ctx.tool_calls = list(tool_calls)
+    for key, value in (memory or {}).items():
+        ctx.remember(key, value)
+    a.on_run_end(ctx, answer)
+    return await a.verify(ctx)
+
+
+def _enriched(payload=None):
+    return ToolCall("enrich_destination", {"city": "Jeddah", "organizationId": ORG},
+                    payload if payload is not None else {"city": "Jeddah", "domains": {}})
+
+
+@pytest.mark.asyncio
+async def test_on_run_end_keeps_the_answer_for_verify():
+    a, ctx = HotelSearchAgent(), _ctx()
+    a.on_run_end(ctx, "the answer")
+    assert ctx.recall(MEM_ANSWER) == "the answer"
+
+
+@pytest.mark.asyncio
+async def test_estimated_weather_fails_verification():
+    """Live: the stay was 1-4 September and Open-Meteo returned 10-13. The model
+    noticed, then filled the gap with numbers that changed on each run."""
+    answer = ("Based on typical September patterns in Jeddah, you can expect "
+              "highs around 35°C during your stay.")
+    result = await _verify(answer, [_enriched()])
+    assert not result.passed
+    assert any("estimates rather than reports" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_reporting_only_what_came_back_passes():
+    answer = ("The forecast covers 10-13 September and returned 28.5-35.1°C. "
+              "It does not cover 1-4 September, so I have no data for your dates.")
+    result = await _verify(answer, [_enriched()])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_estimation_check_does_not_fire_without_an_enrichment_tool():
+    """A plain search may legitimately say check-in is typically 15:00."""
+    answer = "Check-in is typically 15:00 and check-out 12:00."
+    result = await _verify(answer, [ToolCall("search_hotel_availability",
+                                             {"organizationId": ORG}, {"uuid": "U1"})])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_failed_reprice_reported_as_confirmed_fails():
+    """Live, two lines apart: "there's a technical issue with the live rate
+    confirmation tool", then "Confirmed Price: $150.92 USD total"."""
+    a, ctx = HotelSearchAgent(), _ctx()
+    call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
+                    {"error": "HasuraGraphQLError: session expired"})
+    a.on_tool_result(ctx, call)
+    ctx.tool_calls = [call]
+    a.on_run_end(ctx, "There was a technical issue with the tool. "
+                      "**Confirmed Price:** $150.92 USD total.")
+    result = await a.verify(ctx)
+    assert not result.passed
+    assert any("presents a rate as confirmed" in i for i in result.issues)
+
+
+def test_a_failed_reprice_stores_no_price():
+    a, ctx = HotelSearchAgent(), _ctx()
+    a.on_tool_result(ctx, ToolCall("refresh_hotel_price", {"optionRefId": "OPT-9"},
+                                   {"error": "supplier timeout"}))
+    assert ctx.recall(MEM_CONFIRMED_PRICE) is None, "an error dict is not a price"
+
+
+@pytest.mark.asyncio
+async def test_failed_reprice_reported_honestly_passes():
+    a, ctx = HotelSearchAgent(), _ctx()
+    call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
+                    {"error": "supplier timeout"})
+    a.on_tool_result(ctx, call)
+    ctx.tool_calls = [call]
+    a.on_run_end(ctx, "The live rate could not be confirmed. The last price I saw "
+                      "was $150.92, which is not confirmed.")
+    result = await a.verify(ctx)
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_successful_reprice_still_stores_and_passes():
+    a, ctx = HotelSearchAgent(), _ctx()
+    call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
+                    {"price": 340.0})
+    a.on_tool_result(ctx, call)
+    ctx.tool_calls = [call]
+    a.on_run_end(ctx, "Confirmed price: $340.00 USD total.")
+    result = await a.verify(ctx)
+    assert ctx.recall(MEM_CONFIRMED_PRICE) == 340.0
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_option_reference_in_the_answer_fails():
+    answer = ("Your room: KING BED ROOM, option "
+              "33!~|a0!~|b260910!~|c260913!~|d5654415!~|e0!~| — $124.26 total.")
+    result = await _verify(answer, [ToolCall("get_hotel_options", {"organizationId": ORG}, {})])
+    assert not result.passed
+    assert any("supplier option reference" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_promised_memory_without_the_tool_fails():
+    """Live: "I'll remember that preference for future bookings." with no tool
+    chip at all, and the Memory panel still holding the old value."""
+    result = await _verify("I'll remember that preference for future bookings.",
+                           [ToolCall("search_hotel_availability", {"organizationId": ORG}, {})])
+    assert not result.passed
+    assert any("remember_preference was never called" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_promised_memory_with_the_tool_passes():
+    result = await _verify("I've noted your preference for 4-star hotels.",
+                           [ToolCall("remember_preference",
+                                     {"statement": "4-star or better", "key": "hotel_stars"},
+                                     {"stored": True})])
+    assert result.passed, result.issues

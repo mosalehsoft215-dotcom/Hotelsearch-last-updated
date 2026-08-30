@@ -272,3 +272,50 @@ async def test_verify_is_happy_with_ordinary_claims():
                                {"domains": {"weather": {"findings": {
                                    "forecast_2026-09-01": [{"value": "29–38°C, 0 mm rain"}]}}}})]
     assert (await HotelSearchAgent().verify(ctx)).passed
+
+
+# ---------------------------------------------------------------------------
+# The forecast window and the stay are not the same thing. Live: the stay was
+# 1-4 September, Open-Meteo returned 10-13, and the model covered the hole with
+# "typical early September patterns" — invented numbers under a green badge.
+# ---------------------------------------------------------------------------
+
+def _meteo(days, highs, lows, rain):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "geocoding" in str(request.url):
+            return httpx.Response(200, json={"results": [
+                {"name": "Jeddah", "country": "Saudi Arabia",
+                 "latitude": 21.5, "longitude": 39.2}]})
+        return httpx.Response(200, json={"daily": {
+            "time": days, "temperature_2m_max": highs,
+            "temperature_2m_min": lows, "precipitation_sum": rain}})
+    return OpenMeteo(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+async def test_forecast_says_so_when_it_missed_the_dates_asked_for():
+    provider = _meteo(["2026-09-10", "2026-09-11"], [35.1, 34.9], [28.5, 29.1], [0.0, 0.0])
+    claims = await provider.fetch("Jeddah", "weather",
+                                  {"check_in": "2026-09-01", "check_out": "2026-09-04"})
+    gap = next(c for c in claims if c.field_name == "coverage_gap")
+    assert "asked for 2026-09-01 to 2026-09-04" in gap.value
+    assert "2026-09-10 to 2026-09-11" in gap.value
+    assert "no data for the dates requested" in gap.value
+    assert gap.sources, "it has to be sourced, or the index drops it"
+
+
+@pytest.mark.asyncio
+async def test_no_coverage_gap_when_the_dates_are_covered():
+    provider = _meteo(["2026-09-01", "2026-09-02"], [38.0, 39.0], [29.0, 30.0], [0.0, 1.2])
+    claims = await provider.fetch("Jeddah", "weather",
+                                  {"check_in": "2026-09-01", "check_out": "2026-09-02"})
+    assert not any(c.field_name == "coverage_gap" for c in claims)
+
+
+@pytest.mark.asyncio
+async def test_no_coverage_gap_when_no_dates_were_asked_for():
+    """enrich_destination(city) with no dates gets the default window; there is
+    nothing it failed to cover."""
+    provider = _meteo(["2026-08-30", "2026-08-31"], [36.8, 36.8], [30.8, 31.1], [0.0, 0.0])
+    claims = await provider.fetch("Jeddah", "weather", {})
+    assert not any(c.field_name == "coverage_gap" for c in claims)
