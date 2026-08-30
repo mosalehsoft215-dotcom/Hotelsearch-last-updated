@@ -139,6 +139,8 @@ class OpenRouterLLM:
         # afford 527 reported "you requested up to 4000" and no retry at all.
         tried_other_spelling = False
         tried_budget = False
+        original_model = self.model
+        first_failure: tuple[int, str] | None = None
         for attempt in range(3):
             body = dict(base)
             body["model"] = self.model
@@ -183,10 +185,20 @@ class OpenRouterLLM:
                          or (resp.status_code in (400, 404)
                              and re.search(r"model|no endpoints", resp.text, re.I)))):
                 tried_other_spelling = True
+                first_failure = (resp.status_code, resp.text)
                 self.model = free_variant(self.model)
                 continue
 
             if resp.status_code >= 400:
+                # A flip off a rate-limited :free name can land on a spelling the
+                # account cannot reach, turning "429, try again" into "No
+                # endpoints found for inclusionai/ling-3.0-flash-fin" — a name
+                # nobody configured. Report the failure that actually happened.
+                if first_failure and re.search(
+                        r"no endpoints|does not exist|not a valid model", resp.text, re.I):
+                    status, text = first_failure
+                    self.model = original_model
+                    raise LLMError(f"OpenRouter HTTP {status} for {original_model}: {text[:400]}")
                 raise LLMError(f"OpenRouter HTTP {resp.status_code}: {resp.text[:500]}")
             break
 
@@ -645,8 +657,14 @@ class AgentBase(ABC):
                 "Do not call any tools. If no priced hotels were found, say so and "
                 "suggest different dates."})
             resp = await llm.complete(messages, tools=None)
-            output = resp.content or ("I couldn't get priced availability for that "
-                "search yet — please try again shortly or adjust the dates.")
+            # Last resort, and it must not invent a cause. The old wording said
+            # no priced availability was found — printed verbatim after
+            # get_hotel_availability_options had returned four priced rooms,
+            # because the only thing that actually failed was the write-up.
+            output = resp.content or (
+                "I gathered the information for that but did not manage to write it "
+                "up. The tool results are still in this session — ask again and I "
+                "will answer from them without searching afresh.")
             messages.append({"role": "assistant", "content": output})
         self.on_run_end(ctx, output)
         verification = await self.verify(ctx)

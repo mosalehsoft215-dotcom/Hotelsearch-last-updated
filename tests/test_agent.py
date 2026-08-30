@@ -594,3 +594,23 @@ async def test_an_empty_triage_report_fails_verification():
     result = await a.verify(ctx)
     assert not result.passed
     assert any("no written report" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_a_flip_that_lands_nowhere_reports_the_original_failure():
+    """inclusionai/ling-3.0-flash-fin exists only as :free. A 429 on the :free
+    name flipped to the bare one, which 404s — so a transient rate limit was
+    reported as "No endpoints found for <a name nobody configured>"."""
+    transport, seen = _status_transport([
+        (429, {"error": {"message": "Provider returned error", "code": 429}}),
+        (404, {"error": {"message": "No endpoints found for inclusionai/ling-3.0-flash-fin."}}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="inclusionai/ling-3.0-flash-fin:free",
+                        transport=transport)
+    with pytest.raises(LLMError) as exc:
+        await llm.complete([{"role": "user", "content": "hi"}])
+    message = str(exc.value)
+    assert "429" in message, "the rate limit is what went wrong"
+    assert "inclusionai/ling-3.0-flash-fin:free" in message, "and it names the configured model"
+    assert "No endpoints found" not in message
+    assert llm.model == "inclusionai/ling-3.0-flash-fin:free", "the name is restored"
