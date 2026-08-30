@@ -86,6 +86,11 @@
   .enrsearch button:hover{border-color:var(--accent)}
   /* delegation */
   .delrow{display:flex;gap:8px;padding:0 20px;margin-top:14px}
+  /* Without this the row is never hidden. `hidden` works through the browser's
+     own [hidden]{display:none}, and any author rule that sets display beats it —
+     .delrow above does, and both selectors weigh the same, so source order wins.
+     #mem and #enr set no display, which is why only this one needed it. */
+  .delrow[hidden]{display:none}
   .delrow input{flex:1;padding:9px 12px;border-radius:9px;border:1px solid var(--line);
        background:var(--panel);color:var(--ink);font-size:13px;outline:none}
   .delrow input:focus{border-color:var(--accent2)}
@@ -155,7 +160,7 @@
       examples:["Triage the failed booking queue","Summarise queue health and top failure types",
                 "What's failing most in the dead-letter queue?"] },
   };
-  let agent = "hotel", sessionId = null, memOpen = false;
+  let agent = "hotel", sessionId = null, memOpen = false, enrOpen = false, delOpen = false;
   const modelPicker = document.getElementById("model");
 
   fetch("/models").then(r => r.json()).then(d => {
@@ -210,6 +215,10 @@
       return "This model's key was rejected. Pick another model from the dropdown above.";
     if(/no such model|not a valid model/i.test(raw))
       return "This account cannot reach that model. Pick another from the dropdown above.";
+    // The browser says this when the request never reached a server at all — almost
+    // always uvicorn restarting under --reload, or stopped, while the page stayed open.
+    if(/failed to fetch|networkerror|load failed/i.test(raw))
+      return "Can't reach the server. Check that uvicorn is still running on this port, then try again.";
     return raw.length > 240 ? raw.slice(0, 240) + "…" : raw;
   }
 
@@ -255,18 +264,26 @@
       mem.appendChild(card);
     }catch(err){ mem.replaceChildren(el("div","memcard", readable(err))); }
   }
-  memBtn.onclick = () => {
-    memOpen = !memOpen;
-    mem.hidden = !memOpen;
+  // One at a time. Three stacked panels push the conversation off the screen, and
+  // only one of them is ever the answer to the question being asked.
+  function showPanel(which){
+    memOpen = which === "mem" ? !memOpen : false;
+    enrOpen = which === "enr" ? !enrOpen : false;
+    delOpen = which === "del" ? !delOpen : false;
+    mem.hidden = !memOpen; enr.hidden = !enrOpen; delRow.hidden = !delOpen;
     memBtn.classList.toggle("on", memOpen);
-    loadMemory();
-  };
+    enrBtn.classList.toggle("on", enrOpen);
+    delBtn.classList.toggle("on", delOpen);
+    if(memOpen) loadMemory();
+    if(enrOpen) enrichQuery(enrQ.value.trim());
+    if(delOpen) delBrief.focus();
+  }
+  memBtn.onclick = () => showPanel("mem");
 
   /* ---- enrichment index: what RAG actually retrieved, with its score and source ---- */
   const enr=document.getElementById("enr"), enrBtn=document.getElementById("enrtoggle");
   const enrQ=document.getElementById("enrq"), enrOut=document.getElementById("enrout");
   const enrCount=document.getElementById("enrcount");
-  let enrOpen=false;
 
   function host(u){ try{ return new URL(u).hostname.replace(/^www\./,""); }catch{ return u; } }
   // Claim values and titles are scraped web text. neutralise() strips prompt
@@ -312,8 +329,7 @@
       if(!(d.matches||[]).length) enrOut.appendChild(note(d.note || "no match"));
     }catch(err){ enrOut.appendChild(note(readable(err))); }
   }
-  enrBtn.onclick=()=>{ enrOpen=!enrOpen; enr.hidden=!enrOpen; enrBtn.classList.toggle("on",enrOpen);
-                       if(enrOpen) enrichQuery(enrQ.value.trim()); };
+  enrBtn.onclick=()=>showPanel("enr");
   document.getElementById("enrgo").onclick=()=>enrichQuery(enrQ.value.trim());
   enrQ.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); enrichQuery(enrQ.value.trim()); }});
 
@@ -325,9 +341,7 @@
 
   const delRow=document.getElementById("delrow"), delBtn=document.getElementById("deltoggle");
   const delBrief=document.getElementById("delbrief"), delGo=document.getElementById("delgo");
-  let delOpen=false;
-  delBtn.onclick=()=>{ delOpen=!delOpen; delRow.hidden=!delOpen; delBtn.classList.toggle("on",delOpen);
-                       if(delOpen) delBrief.focus(); };
+  delBtn.onclick=()=>showPanel("del");
 
   delGo.onclick=async ()=>{
     const brief=delBrief.value.trim();
