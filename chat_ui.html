@@ -226,6 +226,10 @@
       return "This model's key was rejected. Pick another model from the dropdown above.";
     if(/no such model|not a valid model/i.test(raw))
       return "This account cannot reach that model. Pick another from the dropdown above.";
+    // Both agents work by calling tools. A model that cannot do that has nothing
+    // to fall back on — it would answer from its own head and invent the hotels.
+    if(/tool calling.*not supported|does not support tools/i.test(raw))
+      return "This model can't call tools, and both agents work by calling them. Pick another model from the dropdown above.";
     // The browser says this when the request never reached a server at all — almost
     // always uvicorn restarting under --reload, or stopped, while the page stayed open.
     if(/failed to fetch|networkerror|load failed/i.test(raw))

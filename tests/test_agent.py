@@ -499,3 +499,36 @@ async def test_a_spelling_flip_does_not_consume_the_budget_retry():
     assert [m["model"] for m in seen["sent"]] == [
         "poolside/laguna-s-2.1:free", "poolside/laguna-s-2.1", "poolside/laguna-s-2.1"]
     assert [m["max_tokens"] for m in seen["sent"]] == [4000, 4000, 38]
+
+
+@pytest.mark.asyncio
+async def test_no_endpoints_found_also_retries_the_other_spelling():
+    """inclusionai/ling-3.0-flash-fin is published only as :free. The 404 for
+    the plain name reads "No endpoints found for <id>." and never says "model",
+    so the guard that looked for that word let it through untouched."""
+    transport, seen = _status_transport([
+        (404, {"error": {"message": "No endpoints found for inclusionai/ling-3.0-flash-fin."}}),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="inclusionai/ling-3.0-flash-fin",
+                        transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert llm.model == "inclusionai/ling-3.0-flash-fin:free"
+
+
+@pytest.mark.asyncio
+async def test_the_free_flip_is_openrouter_only():
+    """:free is an OpenRouter naming convention. Appending it on Groq turned
+    "tool calling is not supported with this model" into "the model
+    `groq/compound:free` does not exist" — a different, misleading error."""
+    transport, seen = _status_transport([
+        (400, {"error": {"message": "`tool calling` is not supported with this model"}}),
+    ])
+    llm = OpenRouterLLM(api_key="gsk_x", model="groq/compound",
+                        base_url="https://api.groq.com/openai/v1", transport=transport)
+    with pytest.raises(LLMError) as exc:
+        await llm.complete([{"role": "user", "content": "hi"}])
+    assert "tool calling" in str(exc.value)
+    assert len(seen["sent"]) == 1, "no flip off OpenRouter"
+    assert llm.model == "groq/compound"

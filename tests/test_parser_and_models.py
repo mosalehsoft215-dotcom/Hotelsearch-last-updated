@@ -164,3 +164,18 @@ async def test_a_rejected_model_name_is_retried_with_the_other_spelling():
     assert reply.content == "ok"
     assert seen == ["poolside/laguna-xs-2.1", "poolside/laguna-xs-2.1:free"]
     await llm.aclose()
+
+
+def test_a_slot_can_live_on_a_different_host():
+    """A gsk_ key is a Groq key; openrouter.ai answers it with "Missing
+    Authentication header" because it is not an OpenRouter key at all."""
+    settings = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
+                        OPENROUTER_MODEL="anthropic/claude-haiku-4.5", OPENROUTER_API_KEY="key-a",
+                        OPENROUTER_MODEL_F="groq/compound", OPENROUTER_API_KEY_F="gsk_x",
+                        OPENROUTER_BASE_URL_F="https://api.groq.com/openai/v1")
+    assert settings.base_url_for("groq/compound") == "https://api.groq.com/openai/v1"
+    assert settings.base_url_for("anthropic/claude-haiku-4.5") == settings.openrouter_base_url
+    assert settings.base_url_for("some/unknown") == settings.openrouter_base_url
+    assert build_llm(settings, model="groq/compound").base_url == "https://api.groq.com/openai/v1"
+    # The host travels with the slot; the key still pays only for its own model.
+    assert settings.credentials_for("groq/compound") == ("groq/compound", "gsk_x")

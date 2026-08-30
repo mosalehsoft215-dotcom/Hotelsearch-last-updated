@@ -170,10 +170,18 @@ class OpenRouterLLM:
             # answers 200 — measured on z-ai/glm-5.2 — and the reverse holds for
             # a paid name on an account with no credit. Try the other spelling
             # once in either case; the flag stops it looping.
-            if not tried_other_spelling and (
-                    resp.status_code == 429
-                    or (resp.status_code in (400, 404)
-                        and re.search(r"model", resp.text, re.I))):
+            # "No endpoints found for <id>." is the 404 for a name that exists
+            # only in the other spelling — inclusionai/ling-3.0-flash-fin is
+            # published as :free and nothing else — and it never says "model".
+            # Only on OpenRouter: :free is its naming convention, and appending
+            # it elsewhere turns a readable error into "the model
+            # `groq/compound:free` does not exist", which sends you hunting for
+            # a model that was never the problem.
+            if (not tried_other_spelling
+                    and "openrouter.ai" in self.base_url
+                    and (resp.status_code == 429
+                         or (resp.status_code in (400, 404)
+                             and re.search(r"model|no endpoints", resp.text, re.I)))):
                 tried_other_spelling = True
                 self.model = free_variant(self.model)
                 continue
@@ -216,7 +224,7 @@ def build_llm(settings: Settings | None = None, model: str | None = None) -> Ope
         raise LLMError(f"unsupported LLM_PROVIDER {s.llm_provider!r}; only 'openrouter' is implemented")
     chosen, api_key = s.credentials_for(model)
     return OpenRouterLLM(api_key=api_key, model=chosen,
-                         base_url=s.openrouter_base_url, max_tokens=s.openrouter_max_tokens)
+                         base_url=s.base_url_for(chosen), max_tokens=s.openrouter_max_tokens)
 
 
 """The hotel tools an agent may call. Read and draft only: search, reprice, and

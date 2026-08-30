@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     openrouter_api_key_d: str | None = Field(default=None, alias="OPENROUTER_API_KEY_D")
     openrouter_model_e: str | None = Field(default=None, alias="OPENROUTER_MODEL_E")
     openrouter_api_key_e: str | None = Field(default=None, alias="OPENROUTER_API_KEY_E")
+    openrouter_model_f: str | None = Field(default=None, alias="OPENROUTER_MODEL_F")
+    openrouter_api_key_f: str | None = Field(default=None, alias="OPENROUTER_API_KEY_F")
+    openrouter_model_g: str | None = Field(default=None, alias="OPENROUTER_MODEL_G")
+    openrouter_api_key_g: str | None = Field(default=None, alias="OPENROUTER_API_KEY_G")
+
+    # A slot may live on a different OpenAI-compatible host — a Groq key (gsk_…)
+    # gets "Missing Authentication header" from openrouter.ai, because it is not
+    # an OpenRouter key at all. Unset means the slot uses OPENROUTER_BASE_URL.
+    openrouter_base_url_b: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_B")
+    openrouter_base_url_c: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_C")
+    openrouter_base_url_d: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_D")
+    openrouter_base_url_e: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_E")
+    openrouter_base_url_f: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_F")
+    openrouter_base_url_g: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_G")
 
     llm_provider: Literal["openrouter"] = Field(default="openrouter", alias="LLM_PROVIDER")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
@@ -90,13 +104,17 @@ class Settings(BaseSettings):
 
 
     def model_options(self) -> list[dict[str, str]]:
-        """The models the chat page offers, first one being the default."""
-        pairs = [(self.openrouter_model, self.openrouter_api_key),
-                 (self.openrouter_model_b, self.openrouter_api_key_b),
-                 (self.openrouter_model_c, self.openrouter_api_key_c),
-                 (self.openrouter_model_d, self.openrouter_api_key_d),
-                 (self.openrouter_model_e, self.openrouter_api_key_e)]
-        return [{"model": m, "api_key": k} for m, k in pairs if m and k]
+        """The models the chat page offers, first one being the default. Each
+        carries the host it is reached on, which is not the same for every slot."""
+        slots = [(self.openrouter_model, self.openrouter_api_key, None),
+                 (self.openrouter_model_b, self.openrouter_api_key_b, self.openrouter_base_url_b),
+                 (self.openrouter_model_c, self.openrouter_api_key_c, self.openrouter_base_url_c),
+                 (self.openrouter_model_d, self.openrouter_api_key_d, self.openrouter_base_url_d),
+                 (self.openrouter_model_e, self.openrouter_api_key_e, self.openrouter_base_url_e),
+                 (self.openrouter_model_f, self.openrouter_api_key_f, self.openrouter_base_url_f),
+                 (self.openrouter_model_g, self.openrouter_api_key_g, self.openrouter_base_url_g)]
+        return [{"model": m, "api_key": k, "base_url": b or self.openrouter_base_url}
+                for m, k, b in slots if m and k]
 
     def credentials_for(self, model: str | None) -> tuple[str, str | None]:
         """Match a requested model to the key that pays for it. An unknown name
@@ -107,6 +125,15 @@ class Settings(BaseSettings):
                 if option["model"] == model:
                     return option["model"], option["api_key"]
         return (self.openrouter_model, self.openrouter_api_key)
+
+    def base_url_for(self, model: str | None) -> str:
+        """The host that answers for this model. Kept separate from
+        credentials_for so its two-value return stays as callers expect."""
+        if model:
+            for option in self.model_options():
+                if option["model"] == model:
+                    return option["base_url"]
+        return self.openrouter_base_url
 
 
 @lru_cache
