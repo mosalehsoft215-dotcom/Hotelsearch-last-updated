@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     openrouter_api_key_i: str | None = Field(default=None, alias="OPENROUTER_API_KEY_I")
     openrouter_model_j: str | None = Field(default=None, alias="OPENROUTER_MODEL_J")
     openrouter_api_key_j: str | None = Field(default=None, alias="OPENROUTER_API_KEY_J")
+    openrouter_model_k: str | None = Field(default=None, alias="OPENROUTER_MODEL_K")
+    openrouter_api_key_k: str | None = Field(default=None, alias="OPENROUTER_API_KEY_K")
 
     # A slot may live on a different OpenAI-compatible host — a Groq key (gsk_…)
     # gets "Missing Authentication header" from openrouter.ai, because it is not
@@ -99,6 +101,7 @@ class Settings(BaseSettings):
     openrouter_base_url_h: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_H")
     openrouter_base_url_i: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_I")
     openrouter_base_url_j: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_J")
+    openrouter_base_url_k: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_K")
 
     llm_provider: Literal["openrouter"] = Field(default="openrouter", alias="LLM_PROVIDER")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
@@ -129,7 +132,8 @@ class Settings(BaseSettings):
                  (self.openrouter_model_g, self.openrouter_api_key_g, self.openrouter_base_url_g),
                  (self.openrouter_model_h, self.openrouter_api_key_h, self.openrouter_base_url_h),
                  (self.openrouter_model_i, self.openrouter_api_key_i, self.openrouter_base_url_i),
-                 (self.openrouter_model_j, self.openrouter_api_key_j, self.openrouter_base_url_j)]
+                 (self.openrouter_model_j, self.openrouter_api_key_j, self.openrouter_base_url_j),
+                 (self.openrouter_model_k, self.openrouter_api_key_k, self.openrouter_base_url_k)]
         return [{"model": m, "api_key": k, "base_url": b or self.openrouter_base_url}
                 for m, k, b in slots if m and k]
 

@@ -197,3 +197,27 @@ def test_slots_route_to_their_own_hosts_side_by_side():
     assert settings.base_url_for("anthropic/claude-haiku-4.5") == settings.openrouter_base_url
     assert settings.credentials_for("gpt-4o-mini") == ("gpt-4o-mini", "sk-proj-x")
     assert build_llm(settings, model="gpt-4o-mini").base_url == "https://api.openai.com/v1"
+
+
+def test_a_deepseek_slot_routes_to_its_own_host():
+    """DeepSeek is OpenAI-compatible but on its own host, and its completions
+    live at /chat/completions with no /v1 segment — which the client's
+    f"{base_url}/chat/completions" already produces."""
+    settings = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
+                        OPENROUTER_MODEL="anthropic/claude-haiku-4.5", OPENROUTER_API_KEY="key-a",
+                        OPENROUTER_MODEL_K="deepseek-v4-flash", OPENROUTER_API_KEY_K="sk-deep",
+                        OPENROUTER_BASE_URL_K="https://api.deepseek.com")
+    assert settings.base_url_for("deepseek-v4-flash") == "https://api.deepseek.com"
+    assert settings.credentials_for("deepseek-v4-flash") == ("deepseek-v4-flash", "sk-deep")
+    llm = build_llm(settings, model="deepseek-v4-flash")
+    assert llm.base_url == "https://api.deepseek.com"
+    assert llm.host == "api.deepseek.com", "errors name DeepSeek, not OpenRouter"
+
+
+def test_the_free_suffix_flip_stays_off_deepseek():
+    """:free is an OpenRouter naming convention. deepseek-v4-flash:free does not
+    exist, and appending it would replace a readable 402 with a bogus 404."""
+    from runtime import OpenRouterLLM
+    llm = OpenRouterLLM(api_key="sk-deep", model="deepseek-v4-flash",
+                        base_url="https://api.deepseek.com")
+    assert "openrouter.ai" not in llm.base_url
