@@ -58,12 +58,17 @@ async def enrich_destination(city: str, checkIn: str | None = None,
 
 
 def _note(question: str, matches: list[dict[str, Any]],
-          stale: list[dict[str, Any]] | None = None) -> str | None:
+          stale: list[dict[str, Any]] | None = None,
+          available: int = 0, returned: int = 0) -> str | None:
     """Say which subject came up empty, not just that something did. Asking
     about a city the index has never fetched used to return another city's
     weather at 0.757, because the domain vocabulary matches whatever the
     question is about."""
     if matches:
+        if available > returned:
+            return (f"{returned} of {available} matching claims shown. The rest are "
+                    "not here — ask again with a higher limit rather than reading "
+                    "across the gap.")
         return None
     if stale:
         subject = stale[0].get("entity_ref") or stale[0].get("subject") or "this subject"
@@ -77,7 +82,7 @@ def _note(question: str, matches: list[dict[str, Any]],
     return "nothing enriched so far answers this"
 
 
-async def search_enrichment(question: str, limit: int = 5, subject: str | None = None,
+async def search_enrichment(question: str, limit: int = 12, subject: str | None = None,
                             domain: str | None = None, entityType: str | None = None,
                             entityRef: str | None = None,
                             minScore: float | None = None,
@@ -89,10 +94,18 @@ async def search_enrichment(question: str, limit: int = 5, subject: str | None =
         raise ValueError(f"unknown domain {domain!r}; expected one of {', '.join(DOMAINS)}")
     if entityType and entityType not in ("hotel", "city"):
         raise ValueError(f"unknown entityType {entityType!r}; expected 'hotel' or 'city'")
+    floor = MIN_SCORE if minScore is None else minScore
     matches = _index.search(question, limit=limit, subject=subject, domain=domain,
                             entity_type=entityType, entity_ref=entityRef,
-                            min_score=MIN_SCORE if minScore is None else minScore,
-                            include_stale=includeStale)
+                            min_score=floor, include_stale=includeStale)
+    # How many would have come back unlimited. A weather answer is a series, and
+    # a series is only true whole: asked about 4-8 September, the old default of
+    # 5 returned four forecast days plus the "place" claim, so one day never
+    # reached the agent and it filled the gap from the day beside it. Truncation
+    # has to be visible, not inferred from a count the caller cannot see.
+    available = len(_index.search(question, limit=1000, subject=subject, domain=domain,
+                                  entity_type=entityType, entity_ref=entityRef,
+                                  min_score=floor, include_stale=includeStale))
     # Asked only when nothing current came back, so the answer can say "expired,
     # refetch" instead of "nothing known" — two different situations that used to
     # produce the same note.
@@ -106,7 +119,10 @@ async def search_enrichment(question: str, limit: int = 5, subject: str | None =
         "question": question,
         "indexed_claims": _index.size(),
         "matches": matches,
-        "note": _note(question, matches, expired),
+        "note": _note(question, matches, expired, available, len(matches)),
+        "returned": len(matches),
+        "available": available,
+        "truncated": available > len(matches),
         "stale_held": len(expired),
         "min_score": MIN_SCORE if minScore is None else minScore,
         "usage": ("Claims already fetched from the web, each with its sources and "

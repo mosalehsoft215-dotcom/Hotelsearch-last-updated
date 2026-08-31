@@ -521,7 +521,8 @@ TOOL_SPECS.extend([
             "subject": {"type": "string", "description": "Loose match on the subject line."},
             "domain": {"type": "string", "enum": ["reputation", "location", "facilities",
                        "risk", "weather", "advisory", "news"]},
-            "limit": {"type": "integer", "default": 5},
+            "limit": {"type": "integer", "default": 12,
+                      "description": "A weather answer is a series of days plus a place line; keep this above the number of nights or one day will be missing from what you see."},
         }, "required": ["question"]}}},
     {"type": "function", "function": {
         "name": "remember_preference",

@@ -426,3 +426,58 @@ async def test_stale_claims_are_reachable_when_explicitly_asked_for(monkeypatch)
     shown = await web_tools.search_enrichment("how warm will it be", includeStale=True)
     assert len(shown["matches"]) == 1
     assert shown["matches"][0]["is_stale"] is True
+
+
+def test_a_capitalised_run_is_tried_word_by_word():
+    """"For Makkah, will it be hot" gave the single candidate "For Makkah",
+    which matched no stored entity — so a question naming a city the index held
+    retrieved nothing and the agent answered from the transcript instead."""
+    candidates = mentioned_entities("For Makkah, will it be hot or rainy from 4 to 8 Sep 2026?")
+    assert "Makkah" in candidates
+    assert candidates.index("For Makkah") < candidates.index("Makkah"), \
+        "phrases first, so a real multi-word name still wins over its parts"
+
+
+def test_a_question_naming_a_known_city_mid_phrase_still_retrieves():
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Makkah", "forecast_2099-09-04", datetime.now(timezone.utc)))
+    assert index.search("For Makkah, will it be hot or rainy?"), "was returning nothing"
+    assert index.search("What's the weather in Makkah?")
+
+
+def test_an_unknown_city_inside_a_phrase_still_returns_nothing():
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Makkah", "forecast_2099-09-04", datetime.now(timezone.utc)))
+    assert index.search("For Aswan, will it be hot or rainy?") == []
+
+
+@pytest.mark.asyncio
+async def test_truncation_is_reported_rather_than_left_to_be_inferred(monkeypatch):
+    """Asked about five days, the old default of 5 returned four forecast days
+    plus the place claim — so one day never reached the agent, which filled the
+    gap from the day beside it."""
+    import web_tools
+    now = datetime.now(timezone.utc)
+    index = EnrichmentIndex(SqliteVectorStore())
+    for day in range(4, 9):
+        index.add(_weather("Makkah", f"forecast_2099-09-0{day}", now))
+    monkeypatch.setattr(web_tools, "_index", index)
+
+    tight = await web_tools.search_enrichment("weather in Makkah", limit=3)
+    assert tight["truncated"] is True
+    assert tight["returned"] == 3 and tight["available"] == 5
+    assert "3 of 5" in tight["note"] and "higher limit" in tight["note"]
+
+    whole = await web_tools.search_enrichment("weather in Makkah")
+    assert whole["truncated"] is False
+    assert whole["returned"] == whole["available"] == 5
+    assert whole["note"] is None
+
+
+def test_the_prompt_requires_retrieval_first_and_row_fidelity():
+    from agents.hotel_search_agent import HotelSearchAgent
+    from runtime import AgentContext
+    prompt = HotelSearchAgent().build_prompt(AgentContext(org_id="org-1"))
+    assert "before every enrichment fetch, without exception" in prompt
+    assert "never carry a neighbour's across" in prompt
+    assert "name that day as missing" in prompt

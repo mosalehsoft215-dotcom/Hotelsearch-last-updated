@@ -139,16 +139,26 @@ def mentioned_entities(question: str) -> list[str]:
     name a month. It only has to be good enough to notice that "the weather in
     Aswan" is not a question about Jeddah.
     """
-    found: list[str] = []
+    phrases: list[str] = []
+    singles: list[str] = []
     for phrase in _CAPITALISED.findall(question):
         # "What's" is "what" with a contraction stuck to it, and "what" is in
         # the list. Strip that before deciding, or every question beginning
         # "What's ..." names a place called What's.
         words = [w for w in phrase.split()
                  if re.sub(r"'\w*$", "", w).lower() not in _NOT_A_PLACE]
-        if words:
-            found.append(" ".join(words))
-    return found
+        if not words:
+            continue
+        if len(words) > 1:
+            phrases.append(" ".join(words))
+        # Each word on its own as well. A capitalised run is not always one
+        # name: "For Makkah, will it be hot" gave the single candidate "For
+        # Makkah", which matched no stored entity, so a question naming a city
+        # the index held retrieved nothing at all and the agent answered from
+        # the transcript instead. Phrases first, so a real multi-word name like
+        # "Carawan Hotel" still wins over its parts.
+        singles.extend(words)
+    return [*phrases, *singles]
 
 
 _FORECAST_FIELD = re.compile(r"^forecast_(\d{4}-\d{2}-\d{2})$")

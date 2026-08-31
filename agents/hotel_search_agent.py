@@ -166,6 +166,104 @@ def _totals_in(result: object) -> set[float]:
     return found
 
 
+# A measurement as written in an answer: a temperature, a rainfall figure, a
+# distance. Ranges are matched per number, so "28–40 °C" yields both.
+# The optional low end of a range is part of the same match, so it is bound to
+# the unit that follows it. Windowing backwards from the unit instead picked up
+# whatever number happened to precede it — in "28–40 °C, 0 mm rain" the 28 was
+# being recovered as the low end of the *rainfall* figure.
+_QUOTED_MEASURE = re.compile(
+    r"(?:(\d[\d,]*(?:\.\d+)?)\s*[–—-]\s*)?"
+    r"(\d[\d,]*(?:\.\d+)?)\s*(?:°\s*[CF]|\bdeg(?:rees)?\b|\bmm\b|\bkm\b)", re.I)
+
+
+def _quoted_measures(answer: str) -> list[str]:
+    """Every measurement the answer states, both ends of a range included —
+    "28–40 °C" is two figures and only the second carries the unit."""
+    found: list[str] = []
+    for match in _QUOTED_MEASURE.finditer(answer):
+        low, high = match.group(1), match.group(2)
+        if low:
+            found.append(low)
+        found.append(high)
+    return found
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+# "4 Sep", "Sep 4", "4 September" or "2026-09-04" — how a day gets named in a
+# forecast line.
+_DAY_REF = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"|(\d{1,2})\s+([A-Za-z]{3,9})\b"
+    r"|\b([A-Za-z]{3,9})\s+(\d{1,2})\b")
+
+
+def _day_in_line(line: str) -> str | None:
+    """The forecast date a line is about, as MM-DD, or None."""
+    for match in _DAY_REF.finditer(line):
+        iso_y, iso_m, iso_d, day_first, month_after, month_first, day_after = match.groups()
+        if iso_y:
+            return f"{iso_m}-{iso_d}"
+        day, month = (day_first, month_after) if day_first else (day_after, month_first)
+        number = _MONTHS.get((month or "")[:3].lower())
+        if number and day:
+            return f"{number:02d}-{int(day):02d}"
+    return None
+
+
+def _forecast_by_day(calls: list[ToolCall]) -> dict[str, set[str]]:
+    """Each forecast day the tools returned, keyed MM-DD, with every spelling of
+    the numbers that belong to it."""
+    days: dict[str, set[str]] = {}
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                match = re.fullmatch(r"forecast_(\d{4})-(\d{2})-(\d{2})", str(key))
+                if match:
+                    days.setdefault(f"{match.group(2)}-{match.group(3)}", set()).update(
+                        _numbers_in(item))
+                else:
+                    walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    for call in calls:
+        walk(call.result)
+    return days
+
+
+def _misaligned_days(answer: str, calls: list[ToolCall]) -> list[str]:
+    """Days the answer names but describes with another day's figures.
+
+    Set membership cannot see this: asked about 4-8 September the agent was
+    handed four of the five days and wrote five, so day 4 carried day 5's
+    numbers and each one behind it shifted. Every figure was real; every
+    pairing after the first was wrong.
+    """
+    days = _forecast_by_day(calls)
+    if not days:
+        return []
+    wrong: list[str] = []
+    for line in answer.splitlines():
+        day = _day_in_line(line)
+        if day is None or day not in days:
+            continue
+        stated = _quoted_measures(line)
+        if not stated:
+            continue
+        # Every figure on the line, not any of them. "0 mm rain" is 0 on every
+        # dry day, so an `any` test matched on the rainfall and never looked at
+        # the temperatures — which were the drifted part.
+        if not all(_forms(float(v.replace(",", ""))) & days[day] for v in stated):
+            wrong.append(day)
+    return wrong
+
+
 def _mentions_money(result: object) -> bool:
     """A web claim that quotes a price is out of scope — the supplier owns those."""
     if not isinstance(result, dict):
@@ -221,7 +319,9 @@ Once a room's price is confirmed, keep in memory: {MEM_SESSION_ID} (the search u
 If nothing is available, say so plainly and suggest different dates or a nearby area. Never invent hotels or prices.{known}
 For anything the supplier feed does not answer, use the enrichment tools. enrich_hotel_info covers one hotel — reputation, location, facilities, and risks such as renovation or closure. enrich_destination covers the trip itself — weather for the dates, current travel advice, recent news.
 
-Before fetching, try search_enrichment — it reads what was already fetched, costs nothing, and often already holds the answer.
+Call search_enrichment before every enrichment fetch, without exception — the first question about a city as much as the fifth. It reads what was already fetched, costs nothing, and often holds the answer. Fetch only after it comes back with nothing useful, and say which of the two you used.
+
+When you answer from what a tool returned, copy the numbers across exactly. Round if you like, but round the value that belongs to that row: a forecast is one record per day, so give each day its own figures and never carry a neighbour's across. If a day you were asked about is not in what came back, name that day as missing and answer for the rest. The note on a search_enrichment result tells you when it returned fewer claims than it holds; when it does, ask again with a higher limit instead of reading across the gap.
 
 Decide first whether the message is a request to find hotels or a question about ones already discussed. Anything asking you to find, search, list or price hotels is a search, however it is worded and whatever qualities it mentions — "a 4-star place with a pool and good reviews" is a search. Handle it with search_hotel_availability and its filters, and if no city is named, ask for one. Do not call search_enrichment for it.
 
@@ -294,6 +394,33 @@ Apply what is already known above without being asked again, and say which prefe
                     f"answer estimates rather than reports: {hedge.group(0)!r}. "
                     "Enrichment returned what it returned; say what it covers "
                     "instead of filling the gap")
+
+        # The same cross-check as prices, for the numbers enrichment returns.
+        # Asked about 4-8 September, the agent was handed four of five forecast
+        # days and wrote five anyway: day 4 got day 5's figures and the rest
+        # shifted behind it. Retrieval was working; the write-up was not, and
+        # nothing here looked at it because the check only covered money.
+        enrichment_calls = [c for c in ctx.tool_calls if c.name in _ENRICHMENT_TOOLS]
+        if enrichment_calls and answer.strip():
+            returned: set[str] = set()
+            for call in enrichment_calls:
+                returned |= _numbers_in(call.result)
+            invented = [q for q in _quoted_measures(answer)
+                        if not (_forms(float(q.replace(",", ""))) & returned)]
+            if invented:
+                result.add_issue(
+                    "answer states measurements no enrichment tool returned: "
+                    + ", ".join(sorted(set(invented))[:6])
+                    + ". Report the values as fetched; never round a series into "
+                      "shape or read across a day that is missing")
+            shifted = _misaligned_days(answer, enrichment_calls)
+            if shifted:
+                result.add_issue(
+                    "answer gives another day's figures for "
+                    + ", ".join(shifted[:5])
+                    + ". A forecast is a series: state each day from its own "
+                      "record, and say a day is missing rather than filling it "
+                      "from the one beside it")
 
         if _OPTION_REF.search(answer):
             result.add_issue("answer contains a supplier option reference; it is "

@@ -333,9 +333,14 @@ async def test_estimated_weather_fails_verification():
 
 @pytest.mark.asyncio
 async def test_reporting_only_what_came_back_passes():
-    answer = ("The forecast covers 10-13 September and returned 28.5-35.1°C. "
+    """The fixture now carries the day it quotes, as a real run does — the
+    measurement check reads the tool result, so an answer citing figures the
+    result never held is flagged, which is the point of it."""
+    answer = ("The forecast covers 10-13 September; 13 September is 28.5-35.1°C. "
               "It does not cover 1-4 September, so I have no data for your dates.")
-    result = await _verify(answer, [_enriched()])
+    covered = _enriched({"city": "Jeddah", "domains": {"weather": {"findings": {
+        "forecast_2026-09-13": [{"value": "28.5–35.1°C, 0 mm rain"}]}}}})
+    result = await _verify(answer, [covered])
     assert result.passed, result.issues
 
 
@@ -992,3 +997,73 @@ def test_every_cloudflare_origin_error_is_transient():
     for status in (520, 521, 522, 523, 524):
         assert status in _TRANSIENT, status
     assert 400 not in _TRANSIENT and 402 not in _TRANSIENT and 404 not in _TRANSIENT
+
+
+# ---------------------------------------------------------------------------
+# Reported live on Makkah 4-8 September: retrieval worked, the write-up did not.
+# Day 4 carried day 5's figures and each day behind it shifted. Every number was
+# real, so set membership could not see it — and "0 mm rain" is 0 on every dry
+# day, which masked the temperatures when the test was "any figure matches".
+# ---------------------------------------------------------------------------
+
+_MAKKAH = {"city": "Makkah", "domains": {"weather": {"findings": {
+    "forecast_2026-09-04": [{"value": "31.3–40.7°C, 0 mm rain"}],
+    "forecast_2026-09-05": [{"value": "28.4–40.4°C, 0 mm rain"}],
+    "forecast_2026-09-06": [{"value": "27.2–39.8°C, 0 mm rain"}],
+    "forecast_2026-09-07": [{"value": "30.4–38.9°C, 0 mm rain"}],
+    "forecast_2026-09-08": [{"value": "29.9–40.4°C, 0 mm rain"}]}}}}
+
+
+def _makkah_call():
+    return ToolCall("enrich_destination", {"city": "Makkah", "organizationId": ORG}, _MAKKAH)
+
+
+@pytest.mark.asyncio
+async def test_a_day_given_another_days_figures_is_flagged():
+    drifted = ("4 Sep: 28–40 °C, 0 mm rain\n5 Sep: 27–40 °C, 0 mm rain\n"
+               "6 Sep: 27–40 °C, 0 mm rain\n7 Sep: 30–39 °C, 0 mm rain\n"
+               "8 Sep: 30–40 °C, 0 mm rain")
+    result = await _verify(drifted, [_makkah_call()])
+    assert not result.passed
+    issues = " ".join(result.issues)
+    assert "another day's figures" in issues
+    assert "09-04" in issues and "09-05" in issues
+
+
+@pytest.mark.asyncio
+async def test_the_same_series_stated_faithfully_passes():
+    faithful = ("4 Sep: 31.3–40.7 °C, 0 mm rain\n5 Sep: 28.4–40.4 °C, 0 mm rain\n"
+                "6 Sep: 27.2–39.8 °C, 0 mm rain\n7 Sep: 30.4–38.9 °C, 0 mm rain\n"
+                "8 Sep: 29.9–40.4 °C, 0 mm rain")
+    result = await _verify(faithful, [_makkah_call()])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_rounding_to_the_right_day_is_still_allowed():
+    """31.3 stated as 31 is reporting; 31.3 stated as 28.4's value is not."""
+    rounded = ("4 Sep: 31–41 °C, 0 mm rain\n5 Sep: 28–40 °C, 0 mm rain")
+    result = await _verify(rounded, [_makkah_call()])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_an_iso_dated_line_is_checked_too():
+    result = await _verify("2026-09-04: 28–40 °C", [_makkah_call()])
+    assert not result.passed
+    assert "09-04" in " ".join(result.issues)
+
+
+@pytest.mark.asyncio
+async def test_prose_with_no_day_reference_is_left_alone():
+    """Not every enrichment answer is a table; a summary naming no day cannot be
+    misaligned and must not be graded as if it were."""
+    result = await _verify("Hot and dry throughout, with no rain expected.",
+                           [_makkah_call()])
+    assert result.passed, result.issues
+
+
+def test_a_range_yields_both_of_its_numbers():
+    from agents.hotel_search_agent import _quoted_measures
+    assert set(_quoted_measures("28–40 °C, 0 mm rain")) == {"28", "40", "0"}
+    assert set(_quoted_measures("31.3–40.7 °C")) == {"31.3", "40.7"}
