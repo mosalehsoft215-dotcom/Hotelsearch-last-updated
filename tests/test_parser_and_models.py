@@ -221,3 +221,20 @@ def test_the_free_suffix_flip_stays_off_deepseek():
     llm = OpenRouterLLM(api_key="sk-deep", model="deepseek-v4-flash",
                         base_url="https://api.deepseek.com")
     assert "openrouter.ai" not in llm.base_url
+
+
+def test_a_free_suffixed_id_on_another_host_is_left_alone():
+    """BazaarLink publishes qwen/qwen3.7-flash:free as the real id, and its
+    paid twin 402s on this key. Flipping the suffix off would swap a working
+    model for one that cannot answer — which is why the flip is gated to
+    openrouter.ai rather than keyed on the suffix."""
+    from runtime import OpenRouterLLM
+    settings = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
+                        OPENROUTER_MODEL="anthropic/claude-haiku-4.5", OPENROUTER_API_KEY="key-a",
+                        OPENROUTER_MODEL_L="qwen/qwen3.7-flash:free",
+                        OPENROUTER_API_KEY_L="sk-bl-x",
+                        OPENROUTER_BASE_URL_L="https://api.bazaarlink.ai/v1")
+    assert settings.base_url_for("qwen/qwen3.7-flash:free") == "https://api.bazaarlink.ai/v1"
+    llm = build_llm(settings, model="qwen/qwen3.7-flash:free")
+    assert llm.host == "api.bazaarlink.ai"
+    assert "openrouter.ai" not in llm.base_url, "so the :free flip cannot fire"
