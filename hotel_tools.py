@@ -268,6 +268,28 @@ async def _request(query: str, variables: dict[str, Any], op: str) -> Any:
 # rejects the doc as "no such operation found" when the operationName arg
 # doesn't match a `query/mutation <name>` in the document (confirmed live).
 
+# One selection for both search entry points, because `search` and
+# `getSearchResults` return the same type (SearchResult.hotels is
+# [seachBasicInfo]) and had drifted into selecting different fields.
+#
+# board, cancelPolicy and optionRefId are on that type and were never asked
+# for. Confirmed live: board "Breakfast Included" / code "1331", a cancelPolicy
+# with refundable plus dated penalties, and an optionRefId that
+# refresh_hotel_price accepts as-is. The agent was telling people a search
+# result has no meal plan or cancellation terms, and taking two extra calls to
+# lock a rate it already held the reference for.
+_SEARCH_HOTEL_FIELDS = """
+      hotelName hotelCode available categoryCode amenities
+      optionRefId roomName board boardCode accessCode
+      price { totalPrice net gross currency }
+      cancelPolicy {
+        refundable description
+        cancelPenalties { currency value amount penaltyType deadline hoursBefore
+                          isFullAmount isCalculatedDeadline }
+      }
+      location { city country }
+"""
+
 _Q_DESTINATION = """
 query destinationSearcher($criteria: DestinationSearcherInput!) {
   destinationSearcher(criteria: $criteria) { id code title subtitle type hotelCount }
@@ -290,12 +312,7 @@ query search(
     organizationId: $organizationId, pageSize: $pageSize, applyMarkup: $applyMarkup
   ) {
     uuid count
-    hotels {
-      hotelName hotelCode available
-      price { totalPrice net currency }
-      location { city country }
-      categoryCode
-    }
+    hotels {""" + _SEARCH_HOTEL_FIELDS + """}
   }
 }
 """.strip()
@@ -306,12 +323,7 @@ query getSearchResults($uuid: String!, $organizationId: String!,
   getSearchResults(uuid: $uuid, organizationId: $organizationId,
                    pageNumber: $pageNumber, pageSize: $pageSize, sort: $sort) {
     isComplete count hasMorePages
-    hotels {
-      hotelName hotelCode available
-      price { totalPrice net gross currency }
-      location { city country }
-      categoryCode amenities
-    }
+    hotels {""" + _SEARCH_HOTEL_FIELDS + """}
   }
 }
 """.strip()
@@ -449,6 +461,7 @@ async def get_hotel_search_results(
     minPrice: float | None = None, maxPrice: float | None = None,
     minStars: int | None = None, maxStars: int | None = None,
     amenities: list[str] | None = None,
+    refundableOnly: bool = False, mealPlan: list[str] | None = None,
 ) -> HotelSearchResults:
     """Fetch one page of an existing search, sorted and filtered.
 
@@ -474,7 +487,8 @@ async def get_hotel_search_results(
         page = HotelSearchResults.model_validate(
             await _request(_Q_GET_RESULTS, variables, "getSearchResults") or {})
         hotels = apply_filters(page.hotels or [], min_price=minPrice, max_price=maxPrice,
-                               min_stars=minStars, max_stars=maxStars, amenities=amenities)
+                               min_stars=minStars, max_stars=maxStars, amenities=amenities,
+                               refundable_only=refundableOnly, meal_plan=mealPlan)
         page.hotels = sort_hotels(hotels, sort)
         page.nights = _nights_between(checkIn, checkOut)
         if page.nights:
@@ -566,6 +580,8 @@ async def list_hotel_cancellations(organizationId: str, currency: str, nationali
 @mcp.tool()
 async def refresh_hotel_price(organizationId: str, currency: str, nationality: str,
                               optionRefId: str, applyMarkup: bool = False,
+                              total: float = 0.0, extraMarkup: float = 0.0,
+                              serviceType: int = 0,
                               sessionData: dict[str, Any] | None = None,
                               hotelBookingId: str | None = None,
                               transactionId: str | None = None,
@@ -574,13 +590,37 @@ async def refresh_hotel_price(organizationId: str, currency: str, nationality: s
     book_hotel for the same option passes the freshness and markup checks.
 
     Wire shape (confirmed live): mutation takes hotelBookingId / sessionData
-    (HotelSessionDataInput) / transactionId. HotelSessionDataInput has required
-    Decimal fields (extraMarkup, subtotal, total, transactionSubTotal,
-    transactionTotal) and Int serviceType — the caller supplies these via
-    `sessionData` (or the legacy `payload` alias).
+    (HotelSessionDataInput) / transactionId. HotelSessionDataInput's required
+    Decimal fields are filled from `total` — pass the total price of the option
+    being repriced and the subtotal and transaction figures follow it. An
+    explicit `sessionData` (or the legacy `payload` alias) overrides any of them.
+
+    Needs a transaction. With the session data complete, the supplier's next
+    answer is "Transaction Id should be UUID": a reprice updates a supplier
+    session attached to an existing Core_Transaction, and this agent set has no
+    tool that creates one. So a rate cannot be locked from a pure search flow —
+    pass a `transactionId` from a quotation or booking draft, or treat the price
+    on the search result as the supplier's current price and say plainly that it
+    is not a locked rate.
     """
     require_common_args(organization_id=organizationId, currency=currency, nationality=nationality)
-    session_extras = dict(sessionData or payload or {})
+    # HotelSessionDataInput marks extraMarkup, subtotal, total,
+    # transactionSubTotal, transactionTotal and serviceType required. The model
+    # left them optional so partial callers could validate, and
+    # exclude_none=True then dropped every one — so a reprice with just an
+    # optionRefId went out missing six required fields and came back as a
+    # missing-field error, which the agent reported as "the supplier returned an
+    # error, not a price". Every reprice now sends a complete input; whether it
+    # succeeds is the supplier's business, not the request's shape.
+    session_extras: dict[str, Any] = {
+        "extraMarkup": extraMarkup,
+        "subtotal": total,
+        "total": total,
+        "transactionSubTotal": total,
+        "transactionTotal": total,
+        "serviceType": serviceType,
+    }
+    session_extras.update(sessionData or payload or {})
     session_extras.setdefault("optionRefId", optionRefId)
     session_input = HotelSessionDataInput.model_validate(session_extras).model_dump(exclude_none=True)
     variables = {
@@ -594,7 +634,8 @@ async def refresh_hotel_price(organizationId: str, currency: str, nationality: s
         rec["result"] = env
         require_response_status(env)
         parsed = unwrap(env, HotelMutationPayload).model_dump()
-        refresh_tracker.record_refresh(optionRefId, price=parsed.get("price"), apply_markup=applyMarkup)
+        refresh_tracker.record_refresh(optionRefId, price=parsed.get("price") or total or None,
+                                       apply_markup=applyMarkup)
         return parsed
 
 
@@ -787,15 +828,18 @@ def _has_amenities(h: SearchHotel, wanted: list[str]) -> bool:
 def apply_filters(hotels: list[SearchHotel], *, min_price: float | None = None,
                   max_price: float | None = None, min_stars: int | None = None,
                   max_stars: int | None = None,
-                  amenities: list[str] | None = None) -> list[SearchHotel]:
+                  amenities: list[str] | None = None,
+                  refundable_only: bool = False,
+                  meal_plan: list[str] | None = None) -> list[SearchHotel]:
     """Keep the hotels that match on the fields a search result carries: total
     price, star rating (categoryCode) and amenities.
 
     getSearchResults also takes a server-side `filters` argument, but its input
     type is not confirmed by the backend team yet, so filtering happens here
-    where the returned data is known. Cancellation policy and board/meal plan are
-    not in a search result — they live on the room options, so they cannot be
-    filtered at this level.
+    where the returned data is known. Board and cancellation policy are on the
+    search result too (`board`, `cancelPolicy`), so refundable_only and
+    meal_plan work at this level — the room options still carry the full set of
+    bookable choices per hotel, which a search result does not.
     """
     kept: list[SearchHotel] = []
     for h in hotels:
@@ -813,6 +857,12 @@ def apply_filters(hotels: list[SearchHotel], *, min_price: float | None = None,
             if max_stars is not None and st > max_stars:
                 continue
         if amenities and not _has_amenities(h, amenities):
+            continue
+        # Board and cancellation are on the search result after all, so these
+        # two no longer have to wait for the room-options call.
+        if refundable_only and _refundable(getattr(h, "cancelPolicy", None)) is not True:
+            continue
+        if meal_plan and not _matches_board(h, meal_plan):
             continue
         kept.append(h)
     return kept
@@ -873,6 +923,7 @@ async def search_hotel_availability(
     minPrice: float | None = None, maxPrice: float | None = None,
     minStars: int | None = None, maxStars: int | None = None,
     amenities: list[str] | None = None,
+    refundableOnly: bool = False, mealPlan: list[str] | None = None,
 ) -> HotelAvailabilityResult:
     """Resolve a destination, run an availability search, and return the matching
     priced hotels.
@@ -938,6 +989,7 @@ async def search_hotel_availability(
                     [h for h in (page.hotels or []) if _is_priced(h)],
                     min_price=minPrice, max_price=maxPrice,
                     min_stars=minStars, max_stars=maxStars, amenities=amenities,
+                    refundable_only=refundableOnly, meal_plan=mealPlan,
                 )
                 if len(priced) >= limit or page.isComplete:
                     break
@@ -1070,8 +1122,11 @@ def _refundable(policy: CancelPolicy | None) -> bool | None:
 def _matches_board(option: Any, meal_plan: list[str] | None) -> bool:
     if not meal_plan:
         return True
-    text = " ".join(str(x).lower() for x in
-                    (getattr(option, "boardText", None), getattr(option, "boardCodeSupplier", None)) if x)
+    # A room option calls them boardText/boardCodeSupplier; a search result
+    # calls them board/boardCode. Same fact, two field names.
+    text = " ".join(str(x).lower() for x in (
+        getattr(option, "boardText", None), getattr(option, "boardCodeSupplier", None),
+        getattr(option, "board", None), getattr(option, "boardCode", None)) if x)
     return any(m.strip().lower() in text for m in meal_plan if m and m.strip())
 
 

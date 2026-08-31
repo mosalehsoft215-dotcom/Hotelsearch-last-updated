@@ -362,7 +362,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
         }, "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "search_hotel_availability",
-        "description": "Search hotels for a city and date range. Returns sorted, filtered, priced hotels plus destination alternatives and paging info.",
+        "description": "Search hotels for a city and date range. Each hotel comes back with its cheapest bookable choice: price, board, refundability with penalty and deadline, and an optionRefId that refresh_hotel_price accepts directly.",
         "parameters": {"type": "object", "properties": {
             "city": {"type": "string"},
             "checkIn": {"type": "string", "description": "YYYY-MM-DD"},
@@ -380,6 +380,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "maxStars": {"type": "integer", "description": "Highest star rating to include."},
             "amenities": {"type": "array", "items": {"type": "string"},
                           "description": "Only hotels having all of these, e.g. [\"wifi\", \"pool\"]."},
+            "refundableOnly": {"type": "boolean", "default": False,
+                               "description": "Only hotels whose search-result choice is refundable."},
+            "mealPlan": {"type": "array", "items": {"type": "string"},
+                         "description": "Match the board on the search result, e.g. [\"breakfast\"]."},
             "pageNumber": {"type": "integer", "default": 0},
             "limit": {"type": "integer", "default": 5, "description": "How many hotels to return."},
         }, "required": ["city", "checkIn", "checkOut"]}}},
@@ -399,6 +403,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "maxStars": {"type": "integer", "description": "Highest star rating to include."},
             "amenities": {"type": "array", "items": {"type": "string"},
                           "description": "Only hotels having all of these, e.g. [\"wifi\", \"pool\"]."},
+            "refundableOnly": {"type": "boolean", "default": False,
+                               "description": "Only hotels whose search-result choice is refundable."},
+            "mealPlan": {"type": "array", "items": {"type": "string"},
+                         "description": "Match the board on the search result, e.g. [\"breakfast\"]."},
             "pageNumber": {"type": "integer", "default": 0},
             "pageSize": {"type": "integer", "default": 20},
         }, "required": ["uuid"]}}},
@@ -438,11 +446,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
         }, "required": ["hotelCode", "checkIn", "checkOut"]}}},
     {"type": "function", "function": {
         "name": "refresh_hotel_price",
-        "description": "Confirm the live rate for a selected room before quoting it. Does not book.",
+        "description": "Confirm the live rate for a selected option before quoting it. Does not book. The optionRefId is on the search result, so no other call is needed first.",
         "parameters": {"type": "object", "properties": {
-            "optionRefId": {"type": "string"},
+            "optionRefId": {"type": "string", "description": "From the search result, or a room option's optionId."},
+            "total": {"type": "number", "description": "The total price of the option being repriced, as the tool returned it. The supplier requires it; sending 0 asks it to reprice against nothing."},
+            "transactionId": {"type": "string", "description": "UUID of the transaction the reprice attaches to. The supplier requires one. Without it the call cannot succeed, so do not attempt a lock — report the search price as current and unlocked."},
             "applyMarkup": {"type": "boolean", "default": False},
-        }, "required": ["optionRefId"]}}},
+        }, "required": ["optionRefId", "total"]}}},
     {"type": "function", "function": {
         "name": "list_hotel_bookings",
         "description": "List existing hotel bookings for the organization, newest first.",

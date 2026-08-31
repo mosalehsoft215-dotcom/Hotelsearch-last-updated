@@ -235,6 +235,14 @@ class HotelLocation(_Loose):
 
 
 class SearchHotel(_Loose):
+    """One hotel in a search result (`seachBasicInfo`).
+
+    The board, the cancellation policy and the optionRefId are on this type and
+    were simply never selected — so the agent was told a search result has no
+    meal plan or cancellation terms, and that locking a rate needed a separate
+    room-options call first. Both were wrong: the reference to reprice with is
+    here, next to the price it belongs to.
+    """
     hotelName: str | None = None
     hotelCode: str | None = None
     available: bool | None = None
@@ -242,6 +250,13 @@ class SearchHotel(_Loose):
     location: HotelLocation | None = None
     categoryCode: str | None = None
     amenities: list[Any] | None = None
+    # What refresh_hotel_price takes, straight from the search result.
+    optionRefId: str | None = None
+    roomName: list[str] | None = None
+    board: str | None = None            # e.g. "Breakfast Included", "Room Only"
+    boardCode: str | None = None
+    accessCode: str | None = None
+    cancelPolicy: CancelPolicy | None = None
     pricePerNight: float | None = None   # computed by the tool (total / nights)
 
 

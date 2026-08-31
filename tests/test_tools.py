@@ -946,3 +946,120 @@ async def test_paging_ignores_dates_that_make_no_sense(fake_hasura):
             organizationId=ORG, currency="USD", nationality="AE", uuid="U1",
             checkIn=bad[0], checkOut=bad[1])
         assert page.nights is None, bad
+
+
+# ---------------------------------------------------------------------------
+# seachBasicInfo — the search-result hotel type — carries board, cancelPolicy
+# and optionRefId. None of them were selected, so the agent was told a search
+# result has no meal plan or cancellation terms and that locking a rate needed
+# a separate lookup first. Confirmed live: board "Breakfast Included" / code
+# "1331", dated penalties, and an optionRefId refresh_hotel_price accepts.
+# ---------------------------------------------------------------------------
+
+def _rich(name, total, board="Room Only", refundable=False, stars="4"):
+    return {"hotelName": name, "hotelCode": name[:3].upper(), "available": True,
+            "price": {"totalPrice": total, "currency": "USD"},
+            "location": {"city": "Jeddah", "country": "Saudi Arabia"},
+            "categoryCode": stars, "amenities": [],
+            "optionRefId": f"33!~|a0!~|{name[:3]}", "roomName": ["DELUXE ROOM"],
+            "board": board, "boardCode": "1331" if "Breakfast" in board else "0",
+            "cancelPolicy": {"refundable": refundable, "cancelPenalties": [
+                {"currency": "USD", "amount": round(total / 3, 2),
+                 "deadline": "2026-08-29T21:00:00.000Z"}]}}
+
+
+def test_both_search_queries_ask_for_the_same_fields():
+    """They return the same type and had drifted into different selections."""
+    for query in (srv._Q_START_SEARCH, srv._Q_GET_RESULTS):
+        for wanted in ("optionRefId", "roomName", "board", "boardCode", "cancelPolicy",
+                       "cancelPenalties", "amenities"):
+            assert wanted in query, (wanted, query[:60])
+
+
+@pytest.mark.asyncio
+async def test_a_search_result_carries_board_policy_and_the_reprice_reference(fake_hasura):
+    fake_hasura.responses["destinationSearcher"] = [
+        {"code": "20298", "title": "Jeddah", "type": "CITY"}]
+    fake_hasura.responses["search"] = {"uuid": "U1", "hotels": []}
+    fake_hasura.responses["getSearchResults"] = {
+        "isComplete": True, "count": 61,
+        "hotels": [_rich("Loren Suites", 125.78, board="Breakfast Included")]}
+    out = await srv.search_hotel_availability(
+        organizationId=ORG, city="Jeddah", checkIn="2026-09-01", checkOut="2026-09-04")
+    hotel = out.hotels[0]
+    assert hotel.board == "Breakfast Included"
+    assert hotel.roomName == ["DELUXE ROOM"]
+    assert hotel.optionRefId, "the reference to reprice with is in the search result"
+    assert hotel.cancelPolicy.refundable is False
+    assert hotel.cancelPolicy.cancelPenalties[0].amount == 41.93
+
+
+@pytest.mark.asyncio
+async def test_refundable_and_board_filter_at_search_time(fake_hasura):
+    fake_hasura.responses["destinationSearcher"] = [
+        {"code": "20298", "title": "Jeddah", "type": "CITY"}]
+    fake_hasura.responses["search"] = {"uuid": "U1", "hotels": []}
+    fake_hasura.responses["getSearchResults"] = {
+        "isComplete": True,
+        "hotels": [_rich("Alpha", 100.0, board="Room Only", refundable=False),
+                   _rich("Bravo", 150.0, board="Breakfast Included", refundable=True),
+                   _rich("Cee", 200.0, board="Breakfast Included", refundable=False)]}
+    only_refundable = await srv.search_hotel_availability(
+        organizationId=ORG, city="Jeddah", checkIn="2026-09-01", checkOut="2026-09-04",
+        refundableOnly=True)
+    assert [h.hotelName for h in only_refundable.hotels] == ["Bravo"]
+
+    with_breakfast = await srv.search_hotel_availability(
+        organizationId=ORG, city="Jeddah", checkIn="2026-09-01", checkOut="2026-09-04",
+        mealPlan=["breakfast"])
+    assert [h.hotelName for h in with_breakfast.hotels] == ["Bravo", "Cee"]
+
+
+def test_board_matching_reads_both_field_namings():
+    """A room option calls them boardText/boardCodeSupplier; a search result
+    calls them board/boardCode."""
+    from hotel_tools import _matches_board
+    from hasura import SearchHotel, HotelRoomOption
+    assert _matches_board(SearchHotel(board="Breakfast Included"), ["breakfast"])
+    assert _matches_board(HotelRoomOption(boardText="Breakfast Included"), ["breakfast"])
+    assert not _matches_board(SearchHotel(board="Room Only"), ["breakfast"])
+
+
+@pytest.mark.asyncio
+async def test_a_reprice_always_sends_the_required_session_fields(fake_hasura):
+    """HotelSessionDataInput marks six fields required; the model left them
+    optional and exclude_none=True then dropped every one, so a reprice with
+    just an optionRefId went out missing all six. Live, that came back as a
+    missing-field error the agent reported as "the supplier returned an error,
+    not a price"."""
+    fake_hasura.responses["refreshHotelComponentSession"] = {
+        "status": "success", "message": None, "data": '{"price": 125.78}'}
+    await srv.refresh_hotel_price(
+        organizationId=ORG, currency="USD", nationality="AE",
+        optionRefId="33!~|a0", total=125.78, transactionId="8f6c0e2a-0000-4000-8000-000000000001")
+    sent = fake_hasura.calls[0]["variables"]["sessionData"]
+    for required in ("extraMarkup", "subtotal", "total",
+                     "transactionSubTotal", "transactionTotal", "serviceType"):
+        assert required in sent, required
+    assert sent["total"] == 125.78 and sent["transactionTotal"] == 125.78
+    assert sent["optionRefId"] == "33!~|a0"
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_data_still_wins(fake_hasura):
+    fake_hasura.responses["refreshHotelComponentSession"] = {
+        "status": "success", "message": None, "data": "{}"}
+    await srv.refresh_hotel_price(
+        organizationId=ORG, currency="USD", nationality="AE", optionRefId="X",
+        total=100.0, sessionData={"total": 999.0, "serviceType": 7})
+    sent = fake_hasura.calls[0]["variables"]["sessionData"]
+    assert sent["total"] == 999.0 and sent["serviceType"] == 7
+    assert sent["subtotal"] == 100.0, "the ones not overridden still follow total"
+
+
+def test_the_prompt_does_not_promise_a_lock_it_cannot_make():
+    from agents.hotel_search_agent import HotelSearchAgent
+    from runtime import AgentContext
+    prompt = HotelSearchAgent().build_prompt(AgentContext(org_id=ORG))
+    assert "Locking a rate needs a transaction" in prompt
+    assert "current and not locked" in prompt

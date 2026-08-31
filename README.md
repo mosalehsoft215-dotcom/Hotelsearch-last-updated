@@ -111,25 +111,36 @@ called one.
   (a hotel must have all of them). They apply to the fields a search result
   carries. `getSearchResults` also takes a server-side `filters` argument, but its
   input type is not confirmed by the backend yet, so filtering runs in the tool.
-- Cancellation policy and meal plan are not in a search result — they come with
-  the room options, so filter them there: `get_hotel_availability_options`
-  (inside the search session, by `uuid`) or `get_hotel_options` (no session) take
-  `refundableOnly`, `mealPlan` and price bounds.
+- A search result is richer than it looked. `SearchResult.hotels` is
+  `[seachBasicInfo]`, which carries `board`, `boardCode`, `roomName`,
+  `cancelPolicy` (refundable plus dated penalties) and `optionRefId` — none of
+  which the queries selected. Confirmed live: board `Breakfast Included` / code
+  `1331`, penalties with amounts and deadlines, and an `optionRefId` that
+  `refresh_hotel_price` accepts as-is. So `refundableOnly` and `mealPlan` are
+  search filters, and a rate can be locked straight from a search result.
+  Both search entry points now share one field selection, since `search` and
+  `getSearchResults` return the same type and had drifted apart.
+- The room options remain the way to see the *other* bookable choices at one
+  hotel: `get_hotel_availability_options` (inside the search session, by `uuid`)
+  or `get_hotel_options` (no session) take `refundableOnly`, `mealPlan` and
+  price bounds.
 - `getSearchHotelAvailability` returns `[RoomSearch]`, where each element holds
   `rooms` and `roomsOptions` side by side. `flatten_room_options()` pairs them
   into one record per bookable choice (room type + board + price + policy), which
   is what the tool returns and what the filters run on.
 - `getHotelFullOptions` returns the same `[RoomSearch]` shape under `options`, so
   `get_hotel_options` flattens it the same way. Its `optionId` is the value
-  `refresh_hotel_price` takes as `optionRefId`; `optionRefId` itself is an input
-  to the reprice mutation, not a field any query returns.
+  `refresh_hotel_price` takes as `optionRefId`. On a room option that is the
+  field name; on a search result the field is called `optionRefId` outright.
 - `get_hotel_static_data` returns hotel content. On `HotelObj`, `medias` and
   `facilities` are `[String]`, so neither takes a subselection; `descriptions`
   and `phones` do. `street` is often null — the address is in `addressLines`.
   `extras=["descriptions", "facilities"]` adds the long text and the amenity
   list, opt-in because they are large.
 - Paging: pass `pageNumber` (and `pageSize` on `get_hotel_search_results`); the
-  result carries `count` and `hasMorePages`.
+  result carries `count` and `hasMorePages`. Pass the same `checkIn`/`checkOut`
+  as the search and `pricePerNight` comes back filled in — without them it is
+  null on that path only, which left the agent dividing totals by hand.
 - Currency/nationality default to org fallbacks when a request omits them; pass
   the real values per request, since nationality affects supplier pricing.
 - Ops triage classifies each failure (supplier_timeout, validation_error,
