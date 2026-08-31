@@ -9,11 +9,15 @@ failure is returned as JSON so the page never has to parse an HTML error.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
@@ -49,6 +53,27 @@ class ChatSession:
 
 
 _SESSIONS: dict[str, ChatSession] = {}
+
+
+def record_turn(**fields: Any) -> None:
+    """One line per turn: which model on which host, what it called, whether
+    verify passed, how long it took.
+
+    No message text and no tool payloads — lengths and names only, so the log
+    can be kept and read without carrying customer data. Always logged; also
+    appended to HOTELS_RUN_LOG when that is set.
+    """
+    record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **fields}
+    logger.info("agent_turn", extra={"turn": record})
+    path = _settings.run_log_path
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+    except OSError as exc:
+        # A log that cannot be written must not take the turn with it.
+        logger.warning("run log unwritable: %s", exc)
 
 
 class ChatRequest(BaseModel):
@@ -88,6 +113,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
             ))
             _SESSIONS[key] = session
 
+        started = time.perf_counter()
         async with session.lock:
             llm = build_llm(_settings, model=req.model)
             # ctx.tool_calls accumulates for the life of the session, because
@@ -104,6 +130,14 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
                 await llm.aclose()
 
             session.history = result.messages
+
+        record_turn(session_id=session_id, agent=agent_key,
+                    model=getattr(llm, "model", None), host=getattr(llm, "host", None),
+                    tools=[c.name for c in session.ctx.tool_calls[before:]],
+                    verified=result.verification.passed,
+                    issues=result.verification.issues,
+                    message_chars=len(req.message), output_chars=len(result.output),
+                    ms=round((time.perf_counter() - started) * 1000))
         # Serialise inside the try. FastAPI encodes the return value after the
         # handler exits, so an unencodable value in ctx.recall_all() would escape
         # this except and reach the page as a plain-text 500.
@@ -121,6 +155,9 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         })
     except Exception as exc:  # never 500 — the page expects JSON
         logger.exception("chat failed")
+        record_turn(session_id=session_id, agent=agent_key, model=req.model,
+                    error=f"{type(exc).__name__}: {exc}"[:300],
+                    message_chars=len(req.message))
         return {"error": f"{type(exc).__name__}: {exc}", "session_id": session_id}
 
 
@@ -240,5 +277,15 @@ async def health() -> dict[str, Any]:
 
 @app.get("/models")
 async def models() -> dict[str, Any]:
-    """The models the page can switch between. First one is the default."""
-    return {"models": [o["model"] for o in _settings.model_options()]}
+    """The models the page can switch between. First one is the default.
+
+    `hosts` maps each model to the API host that serves it. The page keeps the
+    conversation when switching between models on one host and starts a fresh
+    one when the host changes — a transcript carries provider-specific fields
+    (Gemini puts a thought_signature on every tool call it makes) that the next
+    provider will not accept.
+    """
+    options = _settings.model_options()
+    return {"models": [o["model"] for o in options],
+            "hosts": {o["model"]: urlparse(o["base_url"]).netloc or o["base_url"]
+                      for o in options}}

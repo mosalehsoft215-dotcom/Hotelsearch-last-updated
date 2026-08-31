@@ -163,7 +163,9 @@
   let agent = "hotel", sessionId = null, memOpen = false, enrOpen = false, delOpen = false;
   const modelPicker = document.getElementById("model");
 
+  let modelHosts = {}, currentModel = null;
   fetch("/models").then(r => r.json()).then(d => {
+    modelHosts = d.hosts || {};
     (d.models || []).forEach((m, i) => {
       const option = document.createElement("option");
       option.value = m;
@@ -171,11 +173,23 @@
       option.selected = (m === localStorage.getItem("model")) || (i === 0 && !localStorage.getItem("model"));
       modelPicker.appendChild(option);
     });
+    currentModel = modelPicker.value;
   }).catch(() => { modelPicker.hidden = true; });
 
+  // Switching model used to wipe the conversation every time. It only has to
+  // when the provider changes: a transcript carries fields belonging to the
+  // provider that produced it — Gemini puts a thought_signature on every tool
+  // call — and the next provider rejects or ignores them. Same host, same
+  // transcript; different host, a fresh one, and the page says which.
   modelPicker.onchange = () => {
     try { localStorage.setItem("model", modelPicker.value); } catch (e) {}
+    const from = modelHosts[currentModel], to = modelHosts[modelPicker.value];
+    currentModel = modelPicker.value;
+    if (from && to && from === to) return;      // conversation continues
     sessionId = null; chat.innerHTML = ""; renderEmpty();
+    if (from && to) bubble("Switched provider (" + from + " to " + to +
+      "), so this is a new conversation — a transcript cannot move between " +
+      "providers. Switching between models on one provider keeps it.", "ag");
   };
   const chat=document.getElementById("chat"), empty=document.getElementById("empty");
   const input=document.getElementById("input"), send=document.getElementById("send");

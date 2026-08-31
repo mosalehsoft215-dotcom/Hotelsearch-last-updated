@@ -1,4 +1,6 @@
 """The /chat web endpoint, driven by a scripted LLM and mocked Hasura."""
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -411,3 +413,36 @@ async def test_one_turn_at_a_time_per_session(monkeypatch, fake_hasura):
     contents = [m.get("content") for m in history]
     assert "first question" in contents and "second question" in contents
     assert "first" in contents and "second" in contents
+
+
+def test_models_reports_the_host_for_each_model():
+    """The page keeps the conversation across models on one host and starts a
+    fresh one across hosts, because a transcript carries provider-specific
+    fields (Gemini's thought_signature) the next provider rejects."""
+    client = TestClient(api.app)
+    body = client.get("/models").json()
+    assert body["models"], "at least the default is configured"
+    assert set(body["hosts"]) == set(body["models"])
+    assert all(h and "/" not in h for h in body["hosts"].values()), body["hosts"]
+
+
+def test_a_turn_is_recorded_without_the_message_text(monkeypatch, client, tmp_path):
+    """The log has to be keepable: names, counts and outcomes, no customer text
+    and no tool payloads."""
+    log = tmp_path / "runs.jsonl"
+    monkeypatch.setattr(api._settings, "run_log_path", str(log), raising=False)
+    client.post("/chat", json={"message": "Find me a hotel in Metroville", "org_id": ORG})
+    lines = log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["agent"] == "hotel" and row["verified"] is True
+    assert "search_hotel_availability" in row["tools"]
+    assert row["message_chars"] == len("Find me a hotel in Metroville")
+    assert isinstance(row["ms"], int) and row["ts"]
+    assert "Metroville" not in lines[0], "no message text in the log"
+
+
+def test_no_log_file_is_written_when_the_path_is_unset(monkeypatch, client, tmp_path):
+    monkeypatch.setattr(api._settings, "run_log_path", None, raising=False)
+    client.post("/chat", json={"message": "hi", "org_id": ORG})
+    assert list(tmp_path.iterdir()) == []

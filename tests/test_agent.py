@@ -771,3 +771,66 @@ def test_the_prompt_refuses_to_invent_dates():
     prompt = HotelSearchAgent().build_prompt(_ctx())
     assert "Dates do not" in prompt
     assert "do not assume one night" in prompt
+
+
+@pytest.mark.asyncio
+async def test_an_honestly_reported_failed_reprice_is_not_flagged():
+    """Live: "the supplier returned an error and could not provide a confirmed
+    price" failed verification, because it contains "confirmed price". The
+    honest answer was the one that got the red badge."""
+    a, ctx = HotelSearchAgent(), _ctx()
+    call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
+                    {"error": "supplier returned no price"})
+    a.on_tool_result(ctx, call)
+    ctx.tool_calls = [_search_call(total=125.78), call]
+    a.on_run_end(ctx, "I tried to confirm the live rate for Loren Suites, but the "
+                      "supplier's system returned an error and could not provide a "
+                      "confirmed price at this moment. Last seen price (not "
+                      "confirmed): $125.78 total.")
+    result = await a.verify(ctx)
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_a_rate_actually_claimed_as_confirmed_still_fails():
+    a, ctx = HotelSearchAgent(), _ctx()
+    call = ToolCall("refresh_hotel_price", {"organizationId": ORG, "optionRefId": "OPT-9"},
+                    {"error": "supplier returned no price"})
+    a.on_tool_result(ctx, call)
+    ctx.tool_calls = [_search_call(total=125.78), call]
+    a.on_run_end(ctx, "There was a technical issue with the tool. "
+                      "Confirmed Price: $125.78 total.")
+    result = await a.verify(ctx)
+    assert not result.passed
+    assert any("presents a rate as confirmed" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_arguments_do_not_end_the_turn():
+    """Live: "tool call arguments were not valid JSON: Expecting ',' delimiter"
+    killed the conversation outright, with the earlier tools already run."""
+    transport, seen = _status_transport([
+        (200, {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "search_hotel_availability",
+                         "arguments": '{"city": "Jeddah" "checkIn": "2026-09-01"}'}}]}}]}),
+        (200, {"choices": [{"message": {"content": "Recovered and answered."}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="m", transport=transport)
+    first = await llm.complete([{"role": "user", "content": "hi"}])
+    assert first.tool_calls[0].invalid_arguments, "the parse failure is carried, not raised"
+    assert first.tool_calls[0].arguments == {}
+
+    ctx = _ctx()
+    llm2 = OpenRouterLLM(api_key="k", model="m", transport=_status_transport([
+        (200, {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "search_hotel_availability",
+                         "arguments": '{"city": "Jeddah" "bad"}'}}]}}]}),
+        (200, {"choices": [{"message": {"content": "Recovered and answered."}}]}),
+    ])[0])
+    res = await HotelSearchAgent().run(ctx, "find hotels", llm2, max_iterations=4)
+    assert res.output == "Recovered and answered."
+    assert ctx.tool_calls == [], "a call that never ran is not recorded as one"
+    told = next(m for m in res.messages if m.get("role") == "tool")
+    assert "not valid JSON" in told["content"]

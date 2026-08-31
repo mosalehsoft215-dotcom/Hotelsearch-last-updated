@@ -26,7 +26,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -136,6 +136,22 @@ def mentioned_entities(question: str) -> list[str]:
     return found
 
 
+_FORECAST_FIELD = re.compile(r"^forecast_(\d{4}-\d{2}-\d{2})$")
+
+
+def _is_past_forecast(claim: "IndexedClaim") -> bool:
+    """A forecast for a day that has already happened cannot answer a question
+    about a stay. It stays in the index as a record; it is not offered as an
+    answer."""
+    match = _FORECAST_FIELD.match(claim.field_name or "")
+    if not match:
+        return False
+    try:
+        return date.fromisoformat(match.group(1)) < date.today()
+    except ValueError:
+        return False
+
+
 class VectorStore(Protocol):
     def upsert(self, claims: Iterable[tuple[IndexedClaim, list[float]]]) -> int: ...
 
@@ -219,7 +235,11 @@ class SqliteVectorStore:
                                  domain=row[3], field_name=row[4], value=row[5],
                                  status=row[6], sources=json.loads(row[7]), observed_at=row[8])
             scored.append((cosine(vector, json.loads(row[9])), claim))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        # Score, then recency. Lexical similarity cannot tell yesterday's
+        # forecast for the wrong week from today's for the right one, so the two
+        # windows tied at 0.739 and came back interleaved in row order. The
+        # fresher observation wins a tie.
+        scored.sort(key=lambda pair: (pair[0], pair[1].observed_at or ""), reverse=True)
         # A limit of 0 or less would return nothing and read as "no match", which
         # the agent then states as fact. One result is the floor.
         return [pair for pair in scored[:max(1, limit)] if pair[0] >= min_score]
@@ -294,9 +314,14 @@ class EnrichmentIndex:
                     entity_ref = matched[0]
                 else:
                     return []      # asked about something this index has never seen
-        hits = self.store.nearest(embed_text(expand(question, domain)), limit, subject,
+        # Ask for more than requested, drop what cannot answer, then trim. A
+        # forecast for a date already past is dead weight that would otherwise
+        # occupy one of the caller's slots forever.
+        hits = self.store.nearest(embed_text(expand(question, domain)),
+                                  max(1, limit) * 4, subject,
                                   domain, entity_type, entity_ref, min_score)
-        return [claim.to_model(score) for score, claim in hits]
+        usable = [(score, claim) for score, claim in hits if not _is_past_forecast(claim)]
+        return [claim.to_model(score) for score, claim in usable[:max(1, limit)]]
 
     def size(self) -> int:
         return self.store.count()

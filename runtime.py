@@ -111,6 +111,10 @@ class LLMToolCall:
     # it — "Function call is missing a thought_signature in functionCall parts"
     # — so a rebuilt-from-parts tool call cannot continue the conversation.
     raw: dict[str, Any] | None = None
+    # Set when the model emitted arguments that are not valid JSON. The call is
+    # kept rather than dropped so the loop can hand the parse error back as this
+    # call's result; the model then corrects itself on the next iteration.
+    invalid_arguments: str | None = None
 
 
 @dataclass
@@ -252,12 +256,18 @@ class OpenRouterLLM:
         for tc in message.get("tool_calls") or []:
             fn = tc.get("function") or {}
             raw = fn.get("arguments") or "{}"
+            invalid = None
             try:
                 args = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            except json.JSONDecodeError as exc:
-                raise LLMError(f"tool call arguments were not valid JSON: {exc.msg}") from exc
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                # Raising here ended the whole turn on one malformed tool call —
+                # seen live as "tool call arguments were not valid JSON:
+                # Expecting ',' delimiter", with the conversation dead and the
+                # tools already run. A model that mis-serialises one call can
+                # fix it if it is told; it cannot if the turn is gone.
+                args, invalid = {}, getattr(exc, "msg", str(exc))
             calls.append(LLMToolCall(id=tc.get("id") or fn.get("name", ""), name=fn.get("name", ""),
-                                     arguments=args, raw=tc))
+                                     arguments=args, raw=tc, invalid_arguments=invalid))
 
         return LLMResponse(content=message.get("content"), tool_calls=calls)
 
@@ -681,6 +691,17 @@ class AgentBase(ABC):
                 } for tc in resp.tool_calls],
             })
             for tc in resp.tool_calls:
+                if tc.invalid_arguments is not None:
+                    # Not dispatched and not recorded as a tool call — it never
+                    # ran. The model is told what was wrong and tries again.
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": json.dumps({"error": (
+                            f"arguments for {tc.name} were not valid JSON "
+                            f"({tc.invalid_arguments}). Send the call again with "
+                            "well-formed JSON arguments.")}),
+                    })
+                    continue
                 try:
                     result = await dispatch(tc.name, tc.arguments, ctx)
                 except Exception as exc:  # surface the failure to the model, keep going

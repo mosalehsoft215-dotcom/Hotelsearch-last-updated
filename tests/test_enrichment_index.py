@@ -1,4 +1,6 @@
 """Free-text search across what enrichment already fetched."""
+from datetime import datetime, timezone
+
 import pytest
 
 from enrichment_index import EnrichmentIndex, IndexedClaim, SqliteVectorStore, cosine
@@ -299,3 +301,39 @@ async def test_the_note_names_the_subject_that_is_missing(monkeypatch):
     out = await web_tools.search_enrichment("What's the weather in Aswan?")
     assert out["matches"] == []
     assert "Aswan" in out["note"]
+
+
+def test_a_fresher_observation_wins_a_tie():
+    """Two forecast windows for one city scored 0.739 each and came back
+    interleaved in row order, so yesterday's fetch for the wrong week sat above
+    today's for the right one."""
+    index = EnrichmentIndex(SqliteVectorStore())
+    stale = Enrichment(subject="Jeddah", domain="weather", entity_type="city",
+                       entity_ref="Jeddah",
+                       claims=[claim("forecast_2099-09-11", "29.1–35°C, 0 mm rain",
+                                     url="https://api.open-meteo.com/x", domain="weather")])
+    stale.claims[0].observed_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    fresh = Enrichment(subject="Jeddah", domain="weather", entity_type="city",
+                       entity_ref="Jeddah",
+                       claims=[claim("forecast_2099-09-02", "29.1–35°C, 0 mm rain",
+                                     url="https://api.open-meteo.com/x", domain="weather")])
+    fresh.claims[0].observed_at = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    index.add(stale)
+    index.add(fresh)
+    fields = [m["field"] for m in index.search("how warm will it be", limit=2)]
+    assert fields[0] == "forecast_2099-09-02", fields
+
+
+def test_a_forecast_for_a_past_date_is_not_offered():
+    """It stays in the index as a record. It cannot answer a question about a
+    stay, so it does not take one of the caller's slots."""
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(Enrichment(subject="Jeddah", domain="weather", entity_type="city",
+                         entity_ref="Jeddah",
+                         claims=[claim("forecast_2020-01-01", "10–15°C, 0 mm rain",
+                                       url="https://api.open-meteo.com/x", domain="weather"),
+                                 claim("forecast_2099-09-02", "29–35°C, 0 mm rain",
+                                       url="https://api.open-meteo.com/x", domain="weather")]))
+    fields = [m["field"] for m in index.search("how warm will it be", limit=5)]
+    assert "forecast_2020-01-01" not in fields
+    assert "forecast_2099-09-02" in fields

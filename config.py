@@ -106,6 +106,11 @@ class Settings(BaseSettings):
     openrouter_model: str = Field(default="anthropic/claude-3-haiku", alias="OPENROUTER_MODEL")
     openrouter_max_tokens: int = Field(default=2000, alias="OPENROUTER_MAX_TOKENS")
     agent_max_iterations: int = Field(default=8, alias="HOTELS_AGENT_MAX_ITERATIONS")
+    # One JSON line per completed turn, appended. Unset writes no file — the
+    # record still goes to the logger either way. Set it when you need to answer
+    # "which model, which tools, did verify pass" about a turn that has scrolled
+    # away, which is every question worth asking after a demo.
+    run_log_path: str | None = Field(default=None, alias="HOTELS_RUN_LOG")
 
     @property
     def yarvel_available(self) -> bool:

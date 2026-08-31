@@ -56,6 +56,27 @@ _CONFIRMED = re.compile(
     r"\bconfirmed\s+(?:price|rate)\b|\b(?:price|rate)\s+confirmed\b"
     r"|\blocked in the rate\b", re.I)
 
+# What turns a claim of confirmation into a report of its absence. "could not
+# provide a confirmed price" contains "confirmed price" and says the opposite;
+# without this, the honest answer to a failed reprice was the one that failed
+# verification, which teaches exactly the wrong lesson.
+_NEGATED = re.compile(
+    r"\b(?:not|never|cannot|can't|cannot|could\s+not|couldn't|unable|failed|fails|"
+    r"failing|without|no|un|isn't|wasn't|weren't|didn't|unconfirmed)\b[^.]{0,60}$",
+    re.I)
+
+
+def _claims_confirmation(answer: str) -> bool:
+    """True only where the answer asserts a confirmed rate, not where it reports
+    that confirmation did not happen."""
+    for match in _CONFIRMED.finditer(answer):
+        before = answer[:match.start()]
+        sentence = re.split(r"(?<=[.!?])\s+", before)[-1] if before else ""
+        if _NEGATED.search(sentence):
+            continue          # "could not provide a confirmed price"
+        return True
+    return False
+
 # The supplier's option reference, e.g. 33!~|a0!~|b260901!~|c260904!~|... It is
 # plumbing for the reprice call and means nothing to a person.
 _OPTION_REF = re.compile(r"!~\|")
@@ -279,7 +300,7 @@ Apply what is already known above without being asked again, and say which prefe
                 result.add_issue(f"reprice happened but {MEM_OPTION_REF} not in memory")
             # A reprice that failed is fine to report — as unconfirmed. What
             # fails here is calling it confirmed with nothing behind it.
-            if ctx.recall(MEM_CONFIRMED_PRICE) is None and _CONFIRMED.search(answer):
+            if ctx.recall(MEM_CONFIRMED_PRICE) is None and _claims_confirmation(answer):
                 result.add_issue("answer presents a rate as confirmed, but the "
                                  "reprice returned no price to confirm it with")
         return result
