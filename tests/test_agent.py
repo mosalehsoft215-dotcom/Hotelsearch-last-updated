@@ -967,3 +967,28 @@ async def test_division_does_not_excuse_an_invented_price():
     result = await _verify("Fiction Hotel is $999 total.", [search])
     assert not result.passed
     assert any("quotes prices no tool returned" in i for i in result.issues)
+
+
+@pytest.mark.asyncio
+async def test_a_cloudflare_524_is_retried():
+    """Several of these providers sit behind Cloudflare. api.llm7.io answered a
+    second turn with 524 "a timeout occurred" — the same transient class as a
+    504, and it was being raised as final."""
+    import runtime
+    runtime._BACKOFF = (0.0, 0.0)
+    transport, seen = _status_transport([
+        (524, {"error": {"message": "a timeout occurred"}}),
+        (200, {"choices": [{"message": {"content": "ok"}}]}),
+    ])
+    llm = OpenRouterLLM(api_key="k", model="minimax-m2.7",
+                        base_url="https://api.llm7.io/v1", transport=transport)
+    reply = await llm.complete([{"role": "user", "content": "hi"}])
+    assert reply.content == "ok"
+    assert len(seen["sent"]) == 2
+
+
+def test_every_cloudflare_origin_error_is_transient():
+    from runtime import _TRANSIENT
+    for status in (520, 521, 522, 523, 524):
+        assert status in _TRANSIENT, status
+    assert 400 not in _TRANSIENT and 402 not in _TRANSIENT and 404 not in _TRANSIENT

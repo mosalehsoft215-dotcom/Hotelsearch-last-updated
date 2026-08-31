@@ -98,7 +98,10 @@ class LLMError(RuntimeError):
 # Retried with backoff rather than raised: rate limits and capacity. Google
 # documents exactly this for the Gemini endpoint, and 503 "experiencing high
 # demand" clears on a second attempt more often than not.
-_TRANSIENT = frozenset({408, 429, 500, 502, 503, 504})
+# 520-524 are Cloudflare's origin errors, and several of these providers sit
+# behind it: api.llm7.io answered a second turn with 524 "a timeout occurred"
+# mid-run. Same transient class as a 504, and the same fix.
+_TRANSIENT = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
 _BACKOFF = (1.0, 4.0)
 
 # One turn should not cost this much prompt. Crossing it means the transcript

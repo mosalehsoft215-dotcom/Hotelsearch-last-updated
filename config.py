@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     openrouter_api_key_k: str | None = Field(default=None, alias="OPENROUTER_API_KEY_K")
     openrouter_model_l: str | None = Field(default=None, alias="OPENROUTER_MODEL_L")
     openrouter_api_key_l: str | None = Field(default=None, alias="OPENROUTER_API_KEY_L")
+    openrouter_model_m: str | None = Field(default=None, alias="OPENROUTER_MODEL_M")
+    openrouter_api_key_m: str | None = Field(default=None, alias="OPENROUTER_API_KEY_M")
+    openrouter_model_n: str | None = Field(default=None, alias="OPENROUTER_MODEL_N")
+    openrouter_api_key_n: str | None = Field(default=None, alias="OPENROUTER_API_KEY_N")
 
     # A slot may live on a different OpenAI-compatible host — a Groq key (gsk_…)
     # gets "Missing Authentication header" from openrouter.ai, because it is not
@@ -105,6 +109,8 @@ class Settings(BaseSettings):
     openrouter_base_url_j: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_J")
     openrouter_base_url_k: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_K")
     openrouter_base_url_l: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_L")
+    openrouter_base_url_m: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_M")
+    openrouter_base_url_n: str | None = Field(default=None, alias="OPENROUTER_BASE_URL_N")
 
     llm_provider: Literal["openrouter"] = Field(default="openrouter", alias="LLM_PROVIDER")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
@@ -137,7 +143,9 @@ class Settings(BaseSettings):
                  (self.openrouter_model_i, self.openrouter_api_key_i, self.openrouter_base_url_i),
                  (self.openrouter_model_j, self.openrouter_api_key_j, self.openrouter_base_url_j),
                  (self.openrouter_model_k, self.openrouter_api_key_k, self.openrouter_base_url_k),
-                 (self.openrouter_model_l, self.openrouter_api_key_l, self.openrouter_base_url_l)]
+                 (self.openrouter_model_l, self.openrouter_api_key_l, self.openrouter_base_url_l),
+                 (self.openrouter_model_m, self.openrouter_api_key_m, self.openrouter_base_url_m),
+                 (self.openrouter_model_n, self.openrouter_api_key_n, self.openrouter_base_url_n)]
         return [{"model": m, "api_key": k, "base_url": b or self.openrouter_base_url}
                 for m, k, b in slots if m and k]
 
