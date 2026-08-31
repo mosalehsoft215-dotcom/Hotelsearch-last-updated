@@ -208,7 +208,7 @@ def test_enrichment_endpoint_reports_size_and_never_fetches(monkeypatch):
     called = {"n": 0}
 
     def fake_search(question, limit=5, subject=None, domain=None, entityType=None,
-                    entityRef=None, minScore=None):
+                    entityRef=None, minScore=None, includeStale=False):
         called["n"] += 1
 
         async def _run():

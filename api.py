@@ -230,7 +230,8 @@ async def memory_view(query: str = "", username: str | None = None,
 @app.get("/enrichment")
 async def enrichment_view(q: str = "", limit: int = 5, domain: str | None = None,
                           entityType: str | None = None, entityRef: str | None = None,
-                          minScore: float | None = None) -> dict[str, Any]:
+                          minScore: float | None = None,
+                          includeStale: bool = False) -> dict[str, Any]:
     """What the enrichment index holds, and what a plain question retrieves from it.
 
     Read-only, and it never fetches: this is the index being queried, not the web.
@@ -242,7 +243,7 @@ async def enrichment_view(q: str = "", limit: int = 5, domain: str | None = None
                     "note": None}
         return await search_enrichment(q, limit=limit, domain=domain,
                                        entityType=entityType, entityRef=entityRef,
-                                       minScore=minScore)
+                                       minScore=minScore, includeStale=includeStale)
     except ValueError as exc:            # unknown domain / entityType
         return {"error": str(exc), "indexed_claims": index_stats(), "matches": []}
     except Exception as exc:

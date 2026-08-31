@@ -57,13 +57,19 @@ async def enrich_destination(city: str, checkIn: str | None = None,
     }
 
 
-def _note(question: str, matches: list[dict[str, Any]]) -> str | None:
+def _note(question: str, matches: list[dict[str, Any]],
+          stale: list[dict[str, Any]] | None = None) -> str | None:
     """Say which subject came up empty, not just that something did. Asking
     about a city the index has never fetched used to return another city's
     weather at 0.757, because the domain vocabulary matches whatever the
     question is about."""
     if matches:
         return None
+    if stale:
+        subject = stale[0].get("entity_ref") or stale[0].get("subject") or "this subject"
+        return (f"everything held for {subject} in this domain has passed its "
+                "freshness window. Fetch it again with enrich_destination or "
+                "enrich_hotel_info rather than answering from it.")
     named = mentioned_entities(question)
     if named:
         return (f"nothing enriched so far covers {named[0]}. "
@@ -74,7 +80,8 @@ def _note(question: str, matches: list[dict[str, Any]]) -> str | None:
 async def search_enrichment(question: str, limit: int = 5, subject: str | None = None,
                             domain: str | None = None, entityType: str | None = None,
                             entityRef: str | None = None,
-                            minScore: float | None = None) -> dict[str, Any]:
+                            minScore: float | None = None,
+                            includeStale: bool = False) -> dict[str, Any]:
     """Ask in plain words across everything enrichment has already fetched, with no
     need to know the entity or the domain first. Narrow with entityType ("hotel"
     or "city"), entityRef, or domain when you do know them."""
@@ -84,12 +91,23 @@ async def search_enrichment(question: str, limit: int = 5, subject: str | None =
         raise ValueError(f"unknown entityType {entityType!r}; expected 'hotel' or 'city'")
     matches = _index.search(question, limit=limit, subject=subject, domain=domain,
                             entity_type=entityType, entity_ref=entityRef,
-                            min_score=MIN_SCORE if minScore is None else minScore)
+                            min_score=MIN_SCORE if minScore is None else minScore,
+                            include_stale=includeStale)
+    # Asked only when nothing current came back, so the answer can say "expired,
+    # refetch" instead of "nothing known" — two different situations that used to
+    # produce the same note.
+    expired = ([] if matches else
+               [m for m in _index.search(question, limit=limit, subject=subject,
+                                         domain=domain, entity_type=entityType,
+                                         entity_ref=entityRef,
+                                         min_score=MIN_SCORE if minScore is None else minScore,
+                                         include_stale=True) if m.get("is_stale")])
     return {
         "question": question,
         "indexed_claims": _index.size(),
         "matches": matches,
-        "note": _note(question, matches),
+        "note": _note(question, matches, expired),
+        "stale_held": len(expired),
         "min_score": MIN_SCORE if minScore is None else minScore,
         "usage": ("Claims already fetched from the web, each with its sources and "
                   "status. Same rules as when they were fetched: attribute them, and "

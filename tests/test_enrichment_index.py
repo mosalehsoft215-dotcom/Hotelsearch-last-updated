@@ -1,5 +1,5 @@
 """Free-text search across what enrichment already fetched."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -303,25 +303,77 @@ async def test_the_note_names_the_subject_that_is_missing(monkeypatch):
     assert "Aswan" in out["note"]
 
 
+def _weather(subject, field, observed, entity_ref=None):
+    e = Enrichment(subject=subject, domain="weather", entity_type="city",
+                   entity_ref=entity_ref or subject,
+                   claims=[claim(field, "29.1–35°C, 0 mm rain",
+                                 url="https://api.open-meteo.com/x", domain="weather")])
+    e.claims[0].observed_at = observed
+    return e
+
+
 def test_a_fresher_observation_wins_a_tie():
-    """Two forecast windows for one city scored 0.739 each and came back
-    interleaved in row order, so yesterday's fetch for the wrong week sat above
-    today's for the right one."""
+    """Two claims that score the same came back in SQL row order, so an older
+    fetch could sit above a newer one. Across subjects, where both legitimately
+    coexist, the fresher observation now leads."""
+    now = datetime.now(timezone.utc)
     index = EnrichmentIndex(SqliteVectorStore())
-    stale = Enrichment(subject="Jeddah", domain="weather", entity_type="city",
-                       entity_ref="Jeddah",
-                       claims=[claim("forecast_2099-09-11", "29.1–35°C, 0 mm rain",
-                                     url="https://api.open-meteo.com/x", domain="weather")])
-    stale.claims[0].observed_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
-    fresh = Enrichment(subject="Jeddah", domain="weather", entity_type="city",
-                       entity_ref="Jeddah",
-                       claims=[claim("forecast_2099-09-02", "29.1–35°C, 0 mm rain",
-                                     url="https://api.open-meteo.com/x", domain="weather")])
-    fresh.claims[0].observed_at = datetime(2026, 8, 31, tzinfo=timezone.utc)
-    index.add(stale)
-    index.add(fresh)
-    fields = [m["field"] for m in index.search("how warm will it be", limit=2)]
-    assert fields[0] == "forecast_2099-09-02", fields
+    index.add(_weather("Jeddah", "forecast_2099-09-02", now - timedelta(hours=2)))
+    index.add(_weather("Riyadh", "forecast_2099-09-02", now))
+    refs = [m["entity_ref"] for m in index.search("how warm will it be", limit=2)]
+    assert refs[0] == "Riyadh", refs
+
+
+def test_a_claim_past_its_domain_window_is_not_served():
+    """The index used to serve whatever it had ever been told. FRESH_FOR_SECONDS
+    governed only the in-process re-fetch cache, so a weather claim from
+    yesterday answered today's question as readily as one from this hour."""
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-02",
+                       datetime.now(timezone.utc) - timedelta(days=1)))
+    assert index.search("how warm will it be") == []
+    assert index.search("how warm will it be", include_stale=True), "still on record"
+
+
+def test_a_fresh_claim_is_served_and_carries_its_expiry():
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-02", datetime.now(timezone.utc)))
+    match = index.search("how warm will it be")[0]
+    assert match["is_stale"] is False
+    assert match["valid_until"] > match["observed_at"]
+
+
+def test_a_new_fetch_retires_the_window_before_it():
+    """The reported fault: asking about one stay came back with the forecast
+    fetched for another. Keyed by field, a September window and an October
+    window for one city both persisted and competed."""
+    now = datetime.now(timezone.utc)
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-11", now - timedelta(minutes=30)))
+    index.add(_weather("Jeddah", "forecast_2099-09-02", now))
+    fields = [m["field"] for m in index.search("how warm will it be", limit=5)]
+    assert fields == ["forecast_2099-09-02"], fields
+    assert index.size() == 1, "the earlier window is gone, not merely outranked"
+
+
+def test_retiring_one_domain_leaves_the_others_alone():
+    now = datetime.now(timezone.utc)
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(Enrichment(subject="Jeddah", domain="advisory", entity_type="city",
+                         entity_ref="Jeddah",
+                         claims=[claim("guidance", "no restrictions",
+                                       url="https://travel.state.gov/x", domain="advisory")]))
+    index.add(_weather("Jeddah", "forecast_2099-09-11", now - timedelta(minutes=30)))
+    index.add(_weather("Jeddah", "forecast_2099-09-02", now))
+    assert index.size() == 2, "the advisory claim survives a weather refetch"
+
+
+def test_a_refetch_for_another_city_retires_nothing():
+    now = datetime.now(timezone.utc)
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-02", now - timedelta(minutes=30)))
+    index.add(_weather("Riyadh", "forecast_2099-09-02", now))
+    assert index.size() == 2
 
 
 def test_a_forecast_for_a_past_date_is_not_offered():
@@ -337,3 +389,40 @@ def test_a_forecast_for_a_past_date_is_not_offered():
     fields = [m["field"] for m in index.search("how warm will it be", limit=5)]
     assert "forecast_2020-01-01" not in fields
     assert "forecast_2099-09-02" in fields
+
+
+@pytest.mark.asyncio
+async def test_expired_and_never_fetched_read_differently(monkeypatch):
+    """Both used to say "nothing enriched so far answers this". One means fetch
+    it; the other means fetch it *again* — and an agent that cannot tell them
+    apart will answer from data past its window."""
+    import web_tools
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-02",
+                       datetime.now(timezone.utc) - timedelta(days=1)))
+    monkeypatch.setattr(web_tools, "_index", index)
+
+    expired = await web_tools.search_enrichment("how warm will it be")
+    assert expired["matches"] == []
+    assert expired["stale_held"] == 1
+    assert "freshness window" in expired["note"]
+    assert "Jeddah" in expired["note"]
+
+    unknown = await web_tools.search_enrichment("what is the pool like")
+    assert unknown["matches"] == []
+    assert unknown["stale_held"] == 0
+    assert unknown["note"] == "nothing enriched so far answers this"
+
+
+@pytest.mark.asyncio
+async def test_stale_claims_are_reachable_when_explicitly_asked_for(monkeypatch):
+    """The panel should be able to show what expired; the agent path should not
+    get it by default."""
+    import web_tools
+    index = EnrichmentIndex(SqliteVectorStore())
+    index.add(_weather("Jeddah", "forecast_2099-09-02",
+                       datetime.now(timezone.utc) - timedelta(days=1)))
+    monkeypatch.setattr(web_tools, "_index", index)
+    shown = await web_tools.search_enrichment("how warm will it be", includeStale=True)
+    assert len(shown["matches"]) == 1
+    assert shown["matches"][0]["is_stale"] is True
