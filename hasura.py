@@ -257,6 +257,9 @@ class HotelSearchResults(_Loose):
     isComplete: bool | None = None
     count: int | None = None
     hasMorePages: bool | None = None
+    # Set when the caller passed the dates, so pricePerNight on each hotel is
+    # filled in the way search_hotel_availability fills it.
+    nights: int | None = None
     hotels: list[SearchHotel] | None = None
 
 

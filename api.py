@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ from agents.hotel_search_agent import HotelSearchAgent
 from agents.ops_triage_agent import OpsTriageAgent
 from config import get_settings
 from memory import build_memory
-from runtime import AgentContext, build_llm, delegate
+from runtime import AgentContext, build_llm, delegate, trim_history
 from web_tools import index_stats, search_enrichment
 
 logger = logging.getLogger("tripon.agents.api")
@@ -50,9 +51,37 @@ class ChatSession:
     # chat's own tool calls and report the parent as changed with no isolation
     # failure behind it. Send and Delegate take this same lock.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    touched_at: float = field(default_factory=time.monotonic)
 
 
-_SESSIONS: dict[str, ChatSession] = {}
+# A console left open for a week held every session it had ever served, each
+# with its transcript and its tool results. Two hours of inactivity, 500
+# sessions at once, oldest out first.
+SESSION_TTL_SECONDS = 2 * 3600
+MAX_SESSIONS = 500
+
+_SESSIONS: "OrderedDict[str, ChatSession]" = OrderedDict()
+
+
+def evict_sessions(now: float | None = None) -> int:
+    """Drop idle sessions, then the oldest if there are still too many.
+
+    Called before a session is looked up, never during a turn — a session in
+    use has just been touched, so it cannot be the one evicted.
+    """
+    moment = time.monotonic() if now is None else now
+    stale = [key for key, session in _SESSIONS.items()
+             if moment - session.touched_at > SESSION_TTL_SECONDS]
+    for key in stale:
+        del _SESSIONS[key]
+    over = 0
+    while len(_SESSIONS) > MAX_SESSIONS:
+        _SESSIONS.popitem(last=False)
+        over += 1
+    if stale or over:
+        logger.info("sessions evicted: %d idle, %d over the cap, %d left",
+                    len(stale), over, len(_SESSIONS))
+    return len(stale) + over
 
 
 def record_turn(**fields: Any) -> None:
@@ -102,6 +131,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         if not org_id:
             return {"error": "No org_id. Pass one, or set YARVEL_ORG_ID in .env.",
                     "session_id": session_id}
+        evict_sessions()
         session = _SESSIONS.get(key)
         if session is None:
             session = ChatSession(ctx=AgentContext(
@@ -112,6 +142,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
                 nationality=req.nationality or _settings.default_nationality,
             ))
             _SESSIONS[key] = session
+        session.touched_at = time.monotonic()
+        _SESSIONS.move_to_end(key)
 
         started = time.perf_counter()
         async with session.lock:
@@ -129,7 +161,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
             finally:
                 await llm.aclose()
 
-            session.history = result.messages
+            # Bounded on store, so the next turn's prompt is bounded too.
+            session.history = trim_history(result.messages)
 
         record_turn(session_id=session_id, agent=agent_key,
                     model=getattr(llm, "model", None), host=getattr(llm, "host", None),
@@ -137,6 +170,10 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
                     verified=result.verification.passed,
                     issues=result.verification.issues,
                     message_chars=len(req.message), output_chars=len(result.output),
+                    prompt_tokens=getattr(llm, "prompt_tokens", 0),
+                    completion_tokens=getattr(llm, "completion_tokens", 0),
+                    cached_tokens=getattr(llm, "cached_tokens", 0),
+                    history_messages=len(session.history),
                     ms=round((time.perf_counter() - started) * 1000))
         # Serialise inside the try. FastAPI encodes the return value after the
         # handler exits, so an unencodable value in ctx.recall_all() would escape

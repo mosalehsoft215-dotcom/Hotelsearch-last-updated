@@ -134,6 +134,38 @@ def _numbers_in(value: object) -> set[str]:
     return found
 
 
+def _nights_seen(calls: list[ToolCall]) -> int | None:
+    """The stay length any priced call reported this session."""
+    for call in calls:
+        if isinstance(call.result, dict):
+            try:
+                nights = int(call.result.get("nights"))
+            except (TypeError, ValueError):
+                continue
+            if nights > 0:
+                return nights
+    return None
+
+
+def _totals_in(result: object) -> set[float]:
+    """Every total a priced result carries, at any depth."""
+    found: set[float] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in ("totalPrice", "net", "gross") and isinstance(item, (int, float)):
+                    found.add(float(item))
+                else:
+                    walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(result)
+    return found
+
+
 def _mentions_money(result: object) -> bool:
     """A web claim that quotes a price is out of scope — the supplier owns those."""
     if not isinstance(result, dict):
@@ -280,6 +312,17 @@ Apply what is already known above without being asked again, and say which prefe
             known: set[str] = set()
             for call in priced_calls:
                 known |= _numbers_in(call.result)
+            # A per-night figure is a returned total divided by the returned
+            # nights, and dividing a tool's own number is not invention.
+            # get_hotel_search_results does not fill pricePerNight in — only
+            # search_hotel_availability does — so once the model pages or
+            # re-sorts it has to divide to answer the same question, and every
+            # per-night price in a correct answer was being called invented.
+            nights = _nights_seen(ctx.tool_calls)
+            if nights:
+                for call in priced_calls:
+                    for total in _totals_in(call.result):
+                        known |= _forms(total / nights)
             invented = []
             for match in _QUOTED_MONEY.finditer(answer):
                 raw = (match.group(1) or match.group(2) or "").replace(",", "")

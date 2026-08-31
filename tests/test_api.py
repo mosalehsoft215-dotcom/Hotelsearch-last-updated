@@ -446,3 +446,52 @@ def test_no_log_file_is_written_when_the_path_is_unset(monkeypatch, client, tmp_
     monkeypatch.setattr(api._settings, "run_log_path", None, raising=False)
     client.post("/chat", json={"message": "hi", "org_id": ORG})
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# A console left open held every session it had ever served, each with its
+# transcript and its tool results.
+# ---------------------------------------------------------------------------
+
+def test_idle_sessions_are_evicted():
+    import time as _time
+    api._SESSIONS.clear()
+    now = _time.monotonic()
+    api._SESSIONS["old:hotel"] = api.ChatSession(
+        ctx=api.AgentContext(org_id=ORG), touched_at=now - api.SESSION_TTL_SECONDS - 1)
+    api._SESSIONS["new:hotel"] = api.ChatSession(
+        ctx=api.AgentContext(org_id=ORG), touched_at=now)
+    assert api.evict_sessions(now) == 1
+    assert list(api._SESSIONS) == ["new:hotel"]
+
+
+def test_the_session_cap_drops_the_oldest_first():
+    api._SESSIONS.clear()
+    for i in range(api.MAX_SESSIONS + 3):
+        api._SESSIONS[f"s{i}:hotel"] = api.ChatSession(ctx=api.AgentContext(org_id=ORG))
+    api.evict_sessions()
+    assert len(api._SESSIONS) == api.MAX_SESSIONS
+    assert "s0:hotel" not in api._SESSIONS
+    assert f"s{api.MAX_SESSIONS + 2}:hotel" in api._SESSIONS
+
+
+def test_a_session_in_use_is_never_the_one_evicted(client):
+    """Eviction runs before the lookup, and a live session was just touched."""
+    api._SESSIONS.clear()
+    for i in range(api.MAX_SESSIONS + 5):
+        api._SESSIONS[f"filler{i}:hotel"] = api.ChatSession(ctx=api.AgentContext(org_id=ORG))
+    body = client.post("/chat", json={"message": "Find me a hotel in Metroville",
+                                      "org_id": ORG, "session_id": "mine"}).json()
+    assert "error" not in body, body
+    assert "mine:hotel" in api._SESSIONS
+    assert len(api._SESSIONS) <= api.MAX_SESSIONS + 1
+
+
+def test_the_turn_log_carries_tokens_and_history_size(monkeypatch, client, tmp_path):
+    log = tmp_path / "runs.jsonl"
+    monkeypatch.setattr(api._settings, "run_log_path", str(log), raising=False)
+    client.post("/chat", json={"message": "Find me a hotel in Metroville", "org_id": ORG})
+    row = json.loads(log.read_text(encoding="utf-8").strip().splitlines()[0])
+    for key in ("prompt_tokens", "completion_tokens", "cached_tokens", "history_messages"):
+        assert key in row, key
+    assert isinstance(row["history_messages"], int)

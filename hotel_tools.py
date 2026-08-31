@@ -444,6 +444,7 @@ async def start_hotel_search(
 async def get_hotel_search_results(
     organizationId: str, currency: str, nationality: str,
     uuid: str, pageNumber: int = 0, pageSize: int = 10,
+    checkIn: str | None = None, checkOut: str | None = None,
     sortField: str = "PRICE", sortOrder: str = "asc",
     minPrice: float | None = None, maxPrice: float | None = None,
     minStars: int | None = None, maxStars: int | None = None,
@@ -454,6 +455,11 @@ async def get_hotel_search_results(
     sortField is PRICE, RATING or RECOMMENDED; sortOrder is asc or desc.
     isComplete tells you when to stop polling; hasMorePages and count describe
     the paging. Filters narrow the page by price, star rating and amenities.
+
+    Pass the same checkIn/checkOut the search used and every hotel comes back
+    with pricePerNight filled in, as search_hotel_availability returns it.
+    Without them the field is null on this path only, which left the agent
+    dividing totals by hand for the same answer.
     """
     require_common_args(organization_id=organizationId, currency=currency, nationality=nationality)
     sort = build_sort(sortField, sortOrder)
@@ -470,6 +476,12 @@ async def get_hotel_search_results(
         hotels = apply_filters(page.hotels or [], min_price=minPrice, max_price=maxPrice,
                                min_stars=minStars, max_stars=maxStars, amenities=amenities)
         page.hotels = sort_hotels(hotels, sort)
+        page.nights = _nights_between(checkIn, checkOut)
+        if page.nights:
+            for hotel in page.hotels:
+                total = _hotel_price(hotel)
+                if total is not None:
+                    hotel.pricePerNight = round(total / page.nights, 2)
         return page
 
 
@@ -713,6 +725,17 @@ def _rooms_occupancy(room_count: int, adults: int, children_ages: list[int] | No
         return raw
     one = [{"age": 30} for _ in range(max(adults, 1))] + [{"age": a} for a in (children_ages or [])]
     return [{"paxes": list(one)} for _ in range(max(room_count, 1))]
+
+
+def _nights_between(check_in: str | None, check_out: str | None) -> int | None:
+    """Nights between two ISO dates, or None when either is missing or unusable."""
+    if not (check_in and check_out):
+        return None
+    try:
+        nights = (date.fromisoformat(check_out) - date.fromisoformat(check_in)).days
+    except (TypeError, ValueError):
+        return None
+    return nights if nights > 0 else None
 
 
 def _hotel_price(h: SearchHotel) -> float | None:

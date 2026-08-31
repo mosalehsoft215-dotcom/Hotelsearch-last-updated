@@ -81,6 +81,7 @@ come back normalised so the loop never touches provider-specific JSON.
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -99,6 +100,13 @@ class LLMError(RuntimeError):
 # demand" clears on a second attempt more often than not.
 _TRANSIENT = frozenset({408, 429, 500, 502, 503, 504})
 _BACKOFF = (1.0, 4.0)
+
+# One turn should not cost this much prompt. Crossing it means the transcript
+# or a tool payload is growing in a way the caps were meant to stop, and the
+# log says so at the time rather than in next month's bill.
+MAX_PROMPT_TOKENS_WARN = 40_000
+
+logger = logging.getLogger("tripon.agents.runtime")
 
 
 @dataclass
@@ -134,6 +142,13 @@ class OpenRouterLLM:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_tokens = max_tokens
+        # Accumulated over this instance's life. One instance serves one turn,
+        # so after the run these are that turn's totals. Providers report them
+        # per call and they are the only honest answer to "why did this cost
+        # that" or "why did this hit the ceiling" once the page has scrolled.
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.cached_tokens = 0
         self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
     @property
@@ -246,6 +261,16 @@ class OpenRouterLLM:
         data = resp.json()
         if data.get("error"):
             raise LLMError(str(data["error"]))
+
+        usage = data.get("usage") or {}
+        self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.completion_tokens += int(usage.get("completion_tokens") or 0)
+        details = usage.get("prompt_tokens_details") or {}
+        self.cached_tokens += int(details.get("cached_tokens") or 0)
+        if self.prompt_tokens > MAX_PROMPT_TOKENS_WARN:
+            logger.warning("%s: %d prompt tokens on model %s this turn — above %d",
+                           self.host, self.prompt_tokens, self.model,
+                           MAX_PROMPT_TOKENS_WARN)
 
         choices = data.get("choices") or []
         if not choices:
@@ -360,9 +385,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
         }, "required": ["city", "checkIn", "checkOut"]}}},
     {"type": "function", "function": {
         "name": "get_hotel_search_results",
-        "description": "Read a page of an existing search by its uuid — to let prices finish loading, to re-sort or re-filter, or to page. Does not start a new search.",
+        "description": "Read a page of an existing search by its uuid — to let prices finish loading, to re-sort or re-filter, or to page. Does not start a new search. Pass the same checkIn/checkOut as the search so pricePerNight comes back filled in.",
         "parameters": {"type": "object", "properties": {
             "uuid": {"type": "string"},
+            "checkIn": {"type": "string", "description": "YYYY-MM-DD, the same one the search used. Needed for pricePerNight."},
+            "checkOut": {"type": "string", "description": "YYYY-MM-DD, the same one the search used. Needed for pricePerNight."},
             "sortField": {"type": "string", "enum": ["PRICE", "RATING", "RECOMMENDED"], "default": "PRICE",
                           "description": "RATING is the star rating. There is no STARS value."},
             "sortOrder": {"type": "string", "enum": ["asc", "desc"], "default": "asc"},
@@ -616,6 +643,53 @@ class AgentRunResult:
     messages: list[dict[str, Any]]
 
 
+# How much transcript a later turn carries, not counting the system prompt.
+# Measured on this agent: each turn adds ~640 tokens (a user line, an assistant
+# tool_calls line, a supplier payload, an answer), so an unbounded transcript
+# reached 8,333 prompt tokens by turn 10 against 2,564 at turn 1 — before the
+# 2,228 tokens of tool specs. Cost, latency and every provider's prompt ceiling
+# all scale with that.
+MAX_HISTORY_MESSAGES = 24
+
+# A single tool result as the model sees it. A 20-hotel search page with full
+# amenity lists, or list_transactions at its default limit, is the bulk of the
+# growth above. The full value still goes to ctx.tool_calls, which is what
+# verify() reads when it checks the prices in an answer against what a tool
+# returned — so capping here costs the model detail, never the checks.
+MAX_TOOL_RESULT_CHARS = 6_000
+
+
+def cap_tool_result(text: str) -> str:
+    """Trim one tool result for the transcript, and say how to avoid the trim."""
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return text
+    return (text[:MAX_TOOL_RESULT_CHARS]
+            + f"… [truncated {len(text) - MAX_TOOL_RESULT_CHARS} characters. "
+            "Narrow it with filters, a smaller limit, or pageNumber rather than "
+            "asking again for the same page.]")
+
+
+def trim_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the system prompt and the most recent exchanges.
+
+    The cut only ever lands on a `user` message. Cutting anywhere else can leave
+    a `tool` message whose `assistant` tool_calls were dropped, and an
+    OpenAI-compatible endpoint rejects that outright — the transcript would be
+    shorter and unusable. Moving the cut forward to a user boundary drops a
+    little more than asked and can never produce that.
+    """
+    if len(messages) <= MAX_HISTORY_MESSAGES + 1:
+        return list(messages)
+    head = messages[:1] if messages[0].get("role") == "system" else []
+    body = messages[len(head):]
+    cut = len(body) - MAX_HISTORY_MESSAGES
+    while cut < len(body) and body[cut].get("role") != "user":
+        cut += 1
+    if cut >= len(body):
+        return list(messages)      # one very long exchange; leave it whole
+    return [*head, *body[cut:]]
+
+
 class AgentBase(ABC):
     @abstractmethod
     def get_role(self) -> str: ...
@@ -711,7 +785,10 @@ class AgentBase(ABC):
                 self.on_tool_result(ctx, call)
                 messages.append({
                     "role": "tool", "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
+                    # Capped for the model only. `call.result` above holds the
+                    # whole thing, so verify() still checks the answer against
+                    # every price the tool actually returned.
+                    "content": cap_tool_result(json.dumps(result, default=str)),
                 })
         if output is None:
             # Either the tool-call cap was hit, or the model stopped without

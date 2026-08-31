@@ -834,3 +834,136 @@ async def test_malformed_tool_arguments_do_not_end_the_turn():
     assert ctx.tool_calls == [], "a call that never ran is not recorded as one"
     told = next(m for m in res.messages if m.get("role") == "tool")
     assert "not valid JSON" in told["content"]
+
+
+# ---------------------------------------------------------------------------
+# Context growth. Measured on this agent before the caps: each turn added ~640
+# prompt tokens, so turn 10 cost 8,333 against turn 1's 2,564 — before the
+# 2,228 tokens of tool specs. Cost, latency and every prompt ceiling scale with
+# that, which is why later turns failed where earlier ones had not.
+# ---------------------------------------------------------------------------
+from runtime import (MAX_HISTORY_MESSAGES, MAX_TOOL_RESULT_CHARS, cap_tool_result,
+                     trim_history)
+
+
+def _turn(n):
+    return [
+        {"role": "user", "content": f"question {n}"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{n}", "type": "function",
+             "function": {"name": "search_hotel_availability", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": f"c{n}", "content": "{}"},
+        {"role": "assistant", "content": f"answer {n}"},
+    ]
+
+
+def test_history_is_bounded_and_keeps_the_system_prompt():
+    messages = [{"role": "system", "content": "S"}]
+    for n in range(20):
+        messages.extend(_turn(n))
+        messages = trim_history(messages)
+    assert messages[0]["role"] == "system"
+    assert len(messages) <= MAX_HISTORY_MESSAGES + 1
+    assert messages[-1]["content"] == "answer 19", "the newest turn survives"
+
+
+def test_the_cut_never_orphans_a_tool_result():
+    """A `tool` message whose assistant tool_calls were dropped is rejected
+    outright by an OpenAI-compatible endpoint — a shorter transcript that no
+    longer works. The window may only open on a user message."""
+    messages = [{"role": "system", "content": "S"}]
+    for n in range(30):
+        messages.extend(_turn(n))
+        messages = trim_history(messages)
+        body = messages[1:]
+        assert not body or body[0]["role"] == "user", body[0]["role"]
+        answered = set()
+        for m in body:
+            for tc in m.get("tool_calls") or []:
+                answered.add(tc["id"])
+            if m["role"] == "tool":
+                assert m["tool_call_id"] in answered, "orphaned tool result"
+
+
+def test_a_short_conversation_is_left_alone():
+    messages = [{"role": "system", "content": "S"}, *_turn(1)]
+    assert trim_history(messages) == messages
+
+
+def test_one_very_long_exchange_is_kept_whole_rather_than_broken():
+    """No user boundary ahead of the cut means any cut would orphan something."""
+    messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "q"}]
+    for n in range(40):
+        messages.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{n}", "type": "function", "function": {"name": "t", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": f"c{n}", "content": "{}"})
+    assert trim_history(messages) == messages
+
+
+def test_a_large_tool_result_is_capped_for_the_model_only():
+    payload = "x" * (MAX_TOOL_RESULT_CHARS + 5000)
+    capped = cap_tool_result(payload)
+    assert len(capped) < len(payload)
+    assert "truncated 5000 characters" in capped
+    assert "pageNumber" in capped, "it says how to avoid the trim"
+    assert cap_tool_result("small") == "small"
+
+
+@pytest.mark.asyncio
+async def test_verify_still_sees_the_full_result_after_capping():
+    """The cap is on the transcript, not on ctx.tool_calls — the price
+    cross-check reads the recorded result and must stay exact."""
+    from runtime import LLMResponse
+    big = {"uuid": "U1", "hotels": [{"hotelName": f"H{i}", "price": {"totalPrice": 100.0 + i}}
+                                    for i in range(400)]}
+    llm = _Scripted([
+        LLMResponse(tool_calls=[LLMToolCall("c1", "search_hotel_availability", {})]),
+        LLMResponse(content="The cheapest is H7 at $107.00 total."),
+    ])
+    ctx = _ctx()
+
+    import runtime
+    async def fake_dispatch(name, args, context):
+        return big
+    original = runtime.dispatch
+    runtime.dispatch = fake_dispatch
+    try:
+        res = await HotelSearchAgent().run(ctx, "find hotels", llm, max_iterations=4)
+    finally:
+        runtime.dispatch = original
+
+    tool_message = next(m for m in res.messages if m["role"] == "tool")
+    assert len(tool_message["content"]) <= MAX_TOOL_RESULT_CHARS + 200, "capped in the transcript"
+    assert len(ctx.tool_calls[0].result["hotels"]) == 400, "whole result recorded"
+    assert res.verification.passed, res.verification.issues
+
+
+@pytest.mark.asyncio
+async def test_a_per_night_price_derived_from_a_returned_total_passes():
+    """Live false positive: "$41.93, $41.97, $44.16" flagged as invented. They
+    are returned totals divided by the returned nights, which is arithmetic on
+    the tool's own numbers — and the only option once paging returns no
+    pricePerNight."""
+    search = ToolCall("search_hotel_availability", {"organizationId": ORG}, {
+        "uuid": "U1", "nights": 3, "hotels": [
+            {"hotelName": "Loren Suites", "pricePerNight": 41.93,
+             "price": {"totalPrice": 125.78, "currency": "USD"}}]})
+    paging = ToolCall("get_hotel_search_results", {"organizationId": ORG}, {
+        "isComplete": True, "hotels": [
+            {"hotelName": "Carawan", "pricePerNight": None,
+             "price": {"totalPrice": 132.47, "currency": "USD"}}]})
+    result = await _verify(
+        "Loren Suites $41.93/night, $125.78 total. Carawan $44.16/night, "
+        "$132.47 total.", [search, paging])
+    assert result.passed, result.issues
+
+
+@pytest.mark.asyncio
+async def test_division_does_not_excuse_an_invented_price():
+    search = ToolCall("search_hotel_availability", {"organizationId": ORG},
+                      {"uuid": "U1", "nights": 3, "hotels": [
+                          {"hotelName": "Loren Suites",
+                           "price": {"totalPrice": 125.78, "currency": "USD"}}]})
+    result = await _verify("Fiction Hotel is $999 total.", [search])
+    assert not result.passed
+    assert any("quotes prices no tool returned" in i for i in result.issues)

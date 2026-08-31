@@ -909,3 +909,40 @@ async def test_get_hotel_booking_returns_its_own_orgs_row(fake_hasura):
     out = await srv.get_hotel_booking(organizationId=ORG, currency="USD",
                                       nationality="AE", Id=42)
     assert out is not None and out.HotelName == "Central Inn"
+
+
+@pytest.mark.asyncio
+async def test_paging_fills_price_per_night_when_given_the_dates(fake_hasura):
+    """search_hotel_availability computes pricePerNight; this path returned null
+    for it, so the agent divided totals by hand for the same answer — which the
+    prompt forbids and the price check then read as invention."""
+    fake_hasura.responses["getSearchResults"] = {
+        "isComplete": True, "count": 62,
+        "hotels": [_hotel("Loren Suites", 125.78), _hotel("Carawan", 132.47)]}
+    page = await srv.get_hotel_search_results(
+        organizationId=ORG, currency="USD", nationality="AE", uuid="U1",
+        checkIn="2026-09-01", checkOut="2026-09-04")
+    assert page.nights == 3
+    assert [h.pricePerNight for h in page.hotels] == [41.93, 44.16]
+
+
+@pytest.mark.asyncio
+async def test_paging_without_dates_leaves_price_per_night_alone(fake_hasura):
+    fake_hasura.responses["getSearchResults"] = {
+        "isComplete": True, "hotels": [_hotel("Loren Suites", 125.78)]}
+    page = await srv.get_hotel_search_results(
+        organizationId=ORG, currency="USD", nationality="AE", uuid="U1")
+    assert page.nights is None
+    assert page.hotels[0].pricePerNight is None
+
+
+@pytest.mark.asyncio
+async def test_paging_ignores_dates_that_make_no_sense(fake_hasura):
+    fake_hasura.responses["getSearchResults"] = {
+        "isComplete": True, "hotels": [_hotel("Loren Suites", 125.78)]}
+    for bad in (("2026-09-04", "2026-09-01"), ("not-a-date", "2026-09-04"),
+                ("2026-09-01", "2026-09-01")):
+        page = await srv.get_hotel_search_results(
+            organizationId=ORG, currency="USD", nationality="AE", uuid="U1",
+            checkIn=bad[0], checkOut=bad[1])
+        assert page.nights is None, bad

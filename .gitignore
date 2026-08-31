@@ -8,3 +8,6 @@ __pycache__/
 scripts/schema_full.json
 *.sqlite3
 *.sqlite3-journal
+# HOTELS_RUN_LOG output
+runs.jsonl
+*.jsonl
