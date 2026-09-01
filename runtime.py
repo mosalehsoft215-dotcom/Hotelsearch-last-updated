@@ -40,6 +40,10 @@ class AgentContext:
     # The user said to answer from what is already stored. Reading the index is
     # still allowed; going back out to the web is not.
     stored_only: bool = False
+    # Where this turn begins in `tool_calls`, which lives as long as the session.
+    # Checks that are about *this* request slice from here; checks that may
+    # legitimately reach back to an earlier turn's search read the whole list.
+    turn_start: int = 0
     parent: "AgentContext | None" = field(default=None, repr=False)
     session: SessionMemory = field(default_factory=SessionMemory)
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -74,10 +78,19 @@ class VerificationResult:
     def __init__(self, passed: bool = True) -> None:
         self.passed = passed
         self.issues: list[str] = []
+        # Things worth saying that do not make the answer wrong. Kept apart from
+        # `issues` on purpose: a failed verification has always meant "this may
+        # be false" — an invented price, a swapped date, a rate called confirmed
+        # that never was. Filing a presentation complaint under the same badge
+        # would teach the reader to ignore it.
+        self.notes: list[str] = []
 
     def add_issue(self, issue: str) -> None:
         self.passed = False
         self.issues.append(issue)
+
+    def add_note(self, note: str) -> None:
+        self.notes.append(note)
 
 
 """OpenRouter chat-completions client (OpenAI-compatible, with function calling).
@@ -100,6 +113,52 @@ from config import Settings, get_settings
 
 class LLMError(RuntimeError):
     pass
+
+
+# What a person is told when a provider fails. The exception text carries the
+# host, the status and the provider's response body — useful in a log, and
+# meaningless in a chat window: "LLMError: api.mistral.ai HTTP 503: {"object":
+# "error"...}" tells the reader nothing they can act on. Each rule keeps the one
+# thing that is actionable and drops the rest; the full detail is logged at the
+# point of failure, not shown.
+_CLEAN_ERRORS = (
+    # Before the credit rule, which this would otherwise match: going over the
+    # in-flight cap is reported as a 402 mentioning credits, but the balance is
+    # fine and a retry succeeds.
+    (re.compile(r"in.?flight", re.I),
+     "Too many requests in flight on this key. Wait about two minutes and send "
+     "again — the model and the key are both fine."),
+    (re.compile(r"prompt tokens limit exceeded", re.I),
+     "This model's key cannot cover a request this size. Pick another model from "
+     "the dropdown above."),
+    (re.compile(r"\b402\b|insufficient credit|can only afford|\bcredits?\b", re.I),
+     "This model's key has no credit left. Pick another model from the dropdown "
+     "above — the rest of the session is unaffected."),
+    (re.compile(r"\b(401|403)\b|unauthor|invalid api key", re.I),
+     "This model's key was rejected. Pick another model from the dropdown above."),
+    (re.compile(r"no such model|not a valid model|model_not_found", re.I),
+     "This account cannot reach that model. Pick another from the dropdown above."),
+    (re.compile(r"tool calling.*not supported|does not support tools", re.I),
+     "This model cannot call tools, and both agents work by calling them. Pick "
+     "another model from the dropdown above."),
+    # Transient: the retry set already tried and the attempts ran out.
+    (re.compile(r"\b(408|429|5\d\d)\b|rate.?limit|timed?.?out|timeout|"
+                r"temporarily|overloaded|capacity|unavailable", re.I),
+     "The model provider is busy or briefly unavailable. Send that again in a "
+     "moment, or pick another model from the dropdown above."),
+)
+
+_GENERIC_ERROR = ("Something went wrong handling that message. Try again, or pick "
+                  "another model from the dropdown above.")
+
+
+def user_facing_error(exc: BaseException | str) -> str:
+    """A clean, actionable line for the reader. Never the provider's own text."""
+    raw = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
+    for pattern, message in _CLEAN_ERRORS:
+        if pattern.search(raw):
+            return message
+    return _GENERIC_ERROR
 
 
 # Retried with backoff rather than raised: rate limits and capacity. Google
@@ -619,6 +678,10 @@ def _jsonable(value: Any) -> Any:
 # The tools that go out to the web. search_enrichment is deliberately not one of
 # them: it only reads what a previous fetch already stored, which is precisely
 # what "use stored enrichment only" asks for.
+# What the user actually said this turn. Kept on the session so verify() can
+# compare the request against the arguments a tool was given.
+MEM_USER_MESSAGE = "last_user_message"
+
 ENRICHMENT_FETCH_TOOLS = frozenset({
     "enrich_hotel_info", "enrich_destination",
     "enrich_company_facts", "enrich_agency_facts",
@@ -840,8 +903,14 @@ class AgentBase(ABC):
     def on_run_start(self, ctx: AgentContext) -> None:
         """Called once at the start of a run. Default: nothing."""
 
-    def build_blocks(self, ctx: AgentContext) -> list[Any] | None:
+    def build_blocks(self, ctx: AgentContext,
+                     calls: list[ToolCall]) -> list[Any] | None:
         """Structured display data for this turn, or None.
+
+        `calls` is this turn's tool calls only — not `ctx.tool_calls`, which
+        accumulates for the life of the session. Reading the whole context here
+        made every later turn re-emit the cards from an earlier one: a weather
+        question after a hotel search came back carrying five hotel cards.
 
         Opt-in: the default is None, so an agent that has nothing tabular to show
         keeps returning prose exactly as it did. Overriding this is the only way
@@ -860,6 +929,13 @@ class AgentBase(ABC):
                   max_iterations: int = 8,
                   history: list[dict[str, Any]] | None = None) -> AgentRunResult:
         specs = specs_for(self.allowed_tools())
+        # Where this turn starts in a context that outlives it. `tool_calls` is
+        # per session, so anything derived "for this turn" has to be sliced from
+        # here rather than read whole.
+        turn_start = ctx.turn_start = len(ctx.tool_calls)
+        # The message this turn is answering, for the checks that compare what
+        # was asked against what was passed to a tool.
+        ctx.remember(MEM_USER_MESSAGE, user_message)
         # Re-read every turn. A chat session reuses one context, so "do not
         # fetch" on turn 3 must not still be blocking on turn 4. A delegated
         # child is the exception: it runs once and keeps what its parent was
@@ -976,7 +1052,7 @@ class AgentBase(ABC):
         # failure here must never cost a turn its answer: the prose is the
         # contract, and the cards are an addition to it.
         try:
-            blocks = self.build_blocks(ctx)
+            blocks = self.build_blocks(ctx, ctx.tool_calls[turn_start:])
         except Exception:
             logger.exception("building display blocks failed; answering without them")
             blocks = None

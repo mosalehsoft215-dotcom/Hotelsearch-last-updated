@@ -12,8 +12,8 @@ from config import get_settings
 from blocks import blocks_from_tool_calls
 from web_enrich import MONEY, is_government_source
 from runtime import (
-    ENRICHMENT_FETCH_TOOLS, AgentBase, AgentContext, AgentRunResult, ToolCall,
-    VerificationResult, build_llm,
+    ENRICHMENT_FETCH_TOOLS, MEM_USER_MESSAGE, AgentBase, AgentContext, AgentRunResult,
+    ToolCall, VerificationResult, build_llm,
 )
 
 ROLE = "hotel_search_agent"
@@ -103,8 +103,8 @@ _PRICED_TOOLS = frozenset({
 
 # A money figure as written in an answer, either order, capturing the number.
 _QUOTED_MONEY = re.compile(
-    r"(?:[$€£]\s?|(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR)\s+)(\d[\d,]*(?:\.\d+)?)"
-    r"|(\d[\d,]*(?:\.\d+)?)\s?(?:[$€£]|(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR))", re.I)
+    r"(?:[$€£]\s?|\b(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR)\s+)(\d[\d,]*(?:\.\d+)?)"
+    r"|(\d[\d,]*(?:\.\d+)?)\s?(?:[$€£]|\b(?:USD|EUR|GBP|SAR|AED|EGP|KWD|QAR)\b)", re.I)
 
 
 def _forms(number: float) -> set[str]:
@@ -223,14 +223,26 @@ def _forecast_by_day(calls: list[ToolCall]) -> dict[str, set[str]]:
     the numbers that belong to it."""
     days: dict[str, set[str]] = {}
 
+    def note(key: str, item: object) -> bool:
+        match = re.fullmatch(r"forecast_(\d{4})-(\d{2})-(\d{2})", str(key))
+        if not match:
+            return False
+        days.setdefault(f"{match.group(2)}-{match.group(3)}", set()).update(
+            _numbers_in(item))
+        return True
+
     def walk(node: object) -> None:
         if isinstance(node, dict):
+            # A retrieved claim names its field in a value, not in a key:
+            # {"field": "forecast_2026-09-10", "value": "27.2–39.8°C"}. Only the
+            # fresh-fetch shape puts the day in the key, so reading keys alone
+            # meant every stored-retrieval weather turn had no per-day check at
+            # all — the alignment guard was inert on exactly the path that
+            # answers most weather questions.
+            if isinstance(node.get("field"), str) and note(node["field"], node.get("value")):
+                return
             for key, item in node.items():
-                match = re.fullmatch(r"forecast_(\d{4})-(\d{2})-(\d{2})", str(key))
-                if match:
-                    days.setdefault(f"{match.group(2)}-{match.group(3)}", set()).update(
-                        _numbers_in(item))
-                else:
+                if not note(key, item):
                     walk(item)
         elif isinstance(node, (list, tuple)):
             for item in node:
@@ -367,6 +379,130 @@ def _asserted_without_source(answer: str, calls: list[ToolCall]) -> list[str]:
                   if (pattern := _FIELD_ASSERTED.get(name)) and pattern.search(answer))
 
 
+# --- what the request left open, and whether a tool went ahead anyway --------
+
+_MENTIONS_CHILDREN = re.compile(
+    r"\b(?:child|children|kid|kids|infant|infants|toddler|toddlers|baby|babies)\b", re.I)
+
+# An age actually stated. Deliberately narrow: this decides whether a search was
+# allowed to run, so it holds only forms that unambiguously give an age.
+_STATES_AGE = re.compile(
+    r"\bage[sd]?\b|\byears?\s+old\b|\b\d{1,2}\s*(?:yo|y/o|yrs?)\b"
+    r"|\b(?:child|kid|infant|toddler)s?\s+(?:aged?|is|are)?\s*\d{1,2}\b", re.I)
+
+# Two possible room counts, not one. "1 or 2 rooms", "2-3 rooms", "1/2 rooms".
+# The trailing noun is required, so a date range like "10-13 September" cannot
+# match.
+_AMBIGUOUS_ROOMS = re.compile(
+    r"\b\d{1,2}\s*(?:or|/|-|–|to)\s*\d{1,2}\s*(?:rooms?|bedrooms?)\b"
+    r"|\brooms?\s*:?\s*\d{1,2}\s*(?:or|/)\s*\d{1,2}\b", re.I)
+
+
+def _child_ages_passed(calls: list[ToolCall]) -> list[int]:
+    """Every child age any search was given this turn, from either argument
+    shape — childrenAges, or the per-room occupancies list."""
+    ages: list[int] = []
+    for call in calls:
+        if call.name not in _PRICED_TOOLS:
+            continue
+        raw = list(call.args.get("childrenAges") or [])
+        for room in call.args.get("occupancies") or []:
+            if isinstance(room, dict):
+                raw.extend(room.get("childrenAges") or [])
+        for age in raw:
+            try:
+                ages.append(int(age))
+            except (TypeError, ValueError):
+                continue
+    return ages
+
+
+def _invented_child_ages(message: str, calls: list[ToolCall]) -> list[int]:
+    """Ages a search was given that the request never contained.
+
+    A child's age changes what the supplier charges and what a room may hold, so
+    a guessed one produces a real price for a booking nobody asked for. The rule
+    is not "ages are missing" — it is "the search ran anyway".
+    """
+    if not _MENTIONS_CHILDREN.search(message or ""):
+        return []
+    ages = _child_ages_passed(calls)
+    if not ages or _STATES_AGE.search(message or ""):
+        return []
+    # The user may have given bare numbers ("two children, 6 and 9"), which the
+    # age pattern above does not claim to catch. If every age passed appears in
+    # the message, it came from them.
+    said = set(re.findall(r"\d{1,2}", message or ""))
+    if all(str(age) in said for age in ages):
+        return []
+    return sorted(set(ages))
+
+
+def _hotels_and_prices(calls: list[ToolCall]) -> dict[str, set[str]]:
+    """Hotel name -> the price spellings that came back with it, for this turn."""
+    found: dict[str, set[str]] = {}
+    for call in calls:
+        if call.name not in _PRICED_TOOLS or not isinstance(call.result, dict):
+            continue
+        for row in (call.result.get("hotels") or call.result.get("options") or []):
+            if not isinstance(row, dict):
+                continue
+            name = row.get("hotelName") or row.get("name")
+            if not name:
+                continue
+            prices: set[str] = set()
+            for value in ((row.get("price") or {}).get("totalPrice"),
+                          row.get("pricePerNight")):
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    prices |= _forms(float(value))
+            found[str(name)] = prices
+    return found
+
+
+# Enough hotels spelled out with their prices that the prose is the list again,
+# not a summary of it.
+DUPLICATE_HOTEL_THRESHOLD = 3
+
+
+def _duplicated_hotel_list(answer: str, calls: list[ToolCall]) -> list[str]:
+    """Hotels the answer sets out in full when a card already carries them.
+
+    The two channels are meant to divide the work: prose says which one to pick
+    and why, cards carry the fields. Repeating every name with its price in the
+    text makes the cards redundant and the message twice as long as it needs to
+    be.
+    """
+    carded = _hotels_and_prices(calls)
+    if len(carded) < DUPLICATE_HOTEL_THRESHOLD:
+        return []
+    quoted = {m.group(1) or m.group(2) for m in _QUOTED_MONEY.finditer(answer)}
+    quoted = {q.replace(",", "") for q in quoted if q}
+    spelled = [name for name, prices in carded.items()
+               if name.lower() in answer.lower() and prices & quoted]
+    return sorted(spelled) if len(spelled) >= DUPLICATE_HOTEL_THRESHOLD else []
+
+
+def _uncovered_days(answer: str, calls: list[ToolCall]) -> list[str]:
+    """Days the answer gives figures for that no forecast covered.
+
+    The complement of `_misaligned_days`, which only looks at days the source
+    has. A day outside the window was skipped by that check entirely, so an
+    answer could carry a real temperature from one date under a different date
+    nobody fetched — both the membership test and the alignment test passed.
+    """
+    days = _forecast_by_day(calls)
+    if not days:
+        return []
+    uncovered: list[str] = []
+    for line in answer.splitlines():
+        day = _day_in_line(line)
+        if day is None or day in days:
+            continue
+        if _quoted_measures(line):      # a bare "no data for 19 Dec" is fine
+            uncovered.append(day)
+    return sorted(set(uncovered))
+
+
 def _mentions_money(result: object) -> bool:
     """A web claim that quotes a price is out of scope — the supplier owns those."""
     if not isinstance(result, dict):
@@ -393,7 +529,12 @@ Organization ID: {ctx.org_id}. It is attached to every tool call automatically. 
 
 Today is {date.today().isoformat()}. Resolve relative dates from today, and always pass full YYYY-MM-DD dates with the correct year — never a past date.
 
-From the request, work out: city, check-in date, check-out date, number of rooms, adults per room, children per room with ages, and any limits the user gave — a budget or price range, a star rating, or amenities they want. If rooms or guests are not given, use 1 room and 2 adults. Get the number of nights from the two dates.
+From the request, work out: city, check-in date, check-out date, number of rooms, adults per room, children per room with ages, and any limits the user gave — a budget or price range, a star rating, or amenities they want. If rooms and guests are not mentioned at all, use 1 room and 2 adults. Get the number of nights from the two dates.
+
+A silent default only applies where the user said nothing. Something said ambiguously is not something unsaid, and must be asked about rather than resolved by you:
+
+- Children. If the request includes a child, an infant or a kid, you need each child's age before you can search — the supplier prices on it and a room may not be allowed to hold the child. If the ages are not given, ask for the age of each child, stop there, and do not call a search tool. Never pick a likely age, never use a range, and never search with the children left out to "get an idea".
+- Room count. "1 or 2 rooms", "2-3 rooms", "one or two" name two possibilities, not a default. Ask which one they want and wait. The same goes for an unresolved number of adults.
 
 Rooms and guests have a sensible default. Dates do not. "Next month", "in September", "sometime soon" name no check-in and no length of stay, so ask for both before searching — do not pick a date and do not assume one night. Every price you show is for the nights you searched, so a stay nobody asked for makes the whole answer wrong. If the city name is ambiguous and the search returns more than one matching place, ask the user which one before continuing.
 
@@ -423,7 +564,13 @@ If nothing is available, say so plainly and suggest different dates or a nearby 
 
 Write the answer as markdown for a person to read: short lead line first, then bullets for one or two records and a table for three or more. Bold for emphasis, dates as "15 Aug 2026", amounts with their currency.
 
-No raw JSON in the answer. Structured display data reaches the page through a separate channel, built from what the tools returned — so when you have listed hotels or confirmed a rate, the reader is already seeing a card for each one underneath your text. Summarise in prose: say which option is cheapest, which is refundable, what the trade-off is. Do not restate every field of every card in a long table as well, unless a comparison genuinely needs one.
+No raw JSON in the answer. Structured display data reaches the page through a separate channel, built from what the tools returned — so when you have listed hotels or confirmed a rate, the reader is already seeing a card for each one underneath your text, with its name, stars, location, board, per-night price, total and cancellation terms.
+
+So do not write that list again. Two or three sentences of prose, and nothing per-hotel. This is the shape:
+
+"Five options in Riyadh for 10-13 Sep, all 3-star and room-only, from 134.98 to 168.20 USD for the three nights. The cheapest is Al Muteb Suites Al Yarmouk; none of the five is refundable, so if you need free cancellation say so and I will filter for it."
+
+That is the whole answer. Notice what it does not contain: no bullet per hotel, no table, no repeated star rating, board, per-night rate or cancellation line — every one of those is already on the card. Give the range rather than each price, name a hotel only when the sentence needs it (the cheapest, the one you would pick), and never list three or more hotels each with its own price.
 
 Never put internal field names, tool names, session or search ids, supplier option references, or any other implementation detail in the answer. That rule is unchanged and the display channel is not an exception to it — it carries the same customer-facing facts, nothing more.{known}
 For anything the supplier feed does not answer, use the enrichment tools. enrich_hotel_info covers one hotel — reputation, location, facilities, and risks such as renovation or closure. enrich_destination covers the trip itself — weather for the dates, current travel advice, recent news. enrich_company_facts covers a chain, brand owner or supplier — legal name, parent or owner, headquarters, year founded, official website, chief executive. enrich_agency_facts covers a travel agency — registered or trading name, country, head office, official website, published contact details, accreditation or licence.
@@ -471,15 +618,19 @@ Apply what is already known above without being asked again, and say which prefe
             if price is not None and not result.get("error"):
                 ctx.remember(MEM_CONFIRMED_PRICE, price)
 
-    def build_blocks(self, ctx: AgentContext):
-        """Cards for the hotels and quotes this turn actually returned.
+    def build_blocks(self, ctx: AgentContext, calls):
+        """Cards for the hotels and quotes *this turn* returned.
 
-        Derived from the supplier payloads on the context, never from the answer
-        text, so a card cannot describe a hotel no search returned. A turn that
-        called no priced tool — a weather question, an advisory, a clarifying
-        question — produces None and renders exactly as it did before.
+        Only this turn's calls: reading ctx.tool_calls, which lives as long as
+        the session, meant a weather question asked after a hotel search came
+        back carrying that search's five cards.
+
+        Derived from the supplier payloads, never from the answer text, so a card
+        cannot describe a hotel no search returned. A turn that called no priced
+        tool — a weather question, an advisory, a clarifying question — produces
+        None and renders exactly as it did before.
         """
-        return blocks_from_tool_calls(ctx.tool_calls)
+        return blocks_from_tool_calls(calls)
 
     def on_run_end(self, ctx: AgentContext, output: str) -> None:
         # verify() only ever inspected tool calls. The faults that matter most —
@@ -569,6 +720,50 @@ Apply what is already known above without being asked again, and say which prefe
                     "answer supplies " + ", ".join(supplied)
                     + ", which enrichment reported as not verified or not found. "
                       "Report those fields as not verified rather than from memory")
+
+            # A day nobody fetched, with figures attached to it. The alignment
+            # check above only inspects days the source has, so this is the
+            # other half: never show a date outside the window that came back.
+            outside = _uncovered_days(answer, enrichment_calls)
+            if outside:
+                result.add_issue(
+                    "answer gives figures for " + ", ".join(outside[:5])
+                    + ", which no forecast covered. Report only the dates the "
+                      "source returned, and say the rest are outside its window")
+
+        # Scoped to this request, not the session: what the user left open on
+        # this turn is what matters, and an earlier turn's search is not
+        # evidence about this one.
+        turn_calls = ctx.tool_calls[ctx.turn_start:]
+        asked = ctx.recall(MEM_USER_MESSAGE) or ""
+
+        # A guessed child age produces a real price for a booking nobody asked
+        # for — the supplier charges on it and a room may not hold the child.
+        guessed = _invented_child_ages(asked, turn_calls)
+        if guessed:
+            result.add_issue(
+                "searched with child age(s) " + ", ".join(str(a) for a in guessed)
+                + " that the request never gave. Ask for each child's age and "
+                  "wait for the answer before searching")
+
+        # Two possible room counts is not a default to pick from.
+        if _AMBIGUOUS_ROOMS.search(asked) and any(c.name in _PRICED_TOOLS
+                                                  for c in turn_calls):
+            result.add_issue(
+                "the request named more than one possible room count and a "
+                "search ran anyway. Ask which one they want before searching — "
+                "the price depends on it")
+
+        # The prose and the cards are meant to divide the work between them.
+        duplicated = _duplicated_hotel_list(answer, turn_calls)
+        if duplicated:
+            # A note, not an issue. The answer is accurate — it is simply the
+            # card list written out twice, and the correctness badge must keep
+            # meaning "this may be false".
+            result.add_note(
+                "answer repeats " + str(len(duplicated)) + " hotels that already "
+                "have cards. The prose should summarise — which to pick and why — "
+                "and leave the fields to the cards")
 
         # The user ruled out going back to the web for this turn. The run loop
         # refuses the call before it happens, so a fetch appearing here means

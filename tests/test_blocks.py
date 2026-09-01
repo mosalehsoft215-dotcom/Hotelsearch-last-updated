@@ -165,7 +165,7 @@ async def test_a_hotel_search_emits_hotel_option_blocks():
     from agents.hotel_search_agent import HotelSearchAgent
     ctx = AgentContext(org_id=ORG)
     ctx.tool_calls.append(search_call())
-    blocks = HotelSearchAgent().build_blocks(ctx)
+    blocks = HotelSearchAgent().build_blocks(ctx, ctx.tool_calls)
 
     assert blocks is not None and len(blocks) == 1
     card = blocks[0]
@@ -187,7 +187,7 @@ async def test_a_confirmed_reprice_emits_a_booking_summary():
         name="refresh_hotel_price", args={},
         result={"price": 361.5, "currency": "USD", "hotelName": "Carawan Al Fahad",
                 "roomName": ["Double Room"], "board": "Breakfast Included", "nights": 3}))
-    blocks = HotelSearchAgent().build_blocks(ctx)
+    blocks = HotelSearchAgent().build_blocks(ctx, ctx.tool_calls)
 
     assert blocks is not None and isinstance(blocks[0], BookingSummaryBlock)
     assert blocks[0].total == 361.5 and blocks[0].currency == "USD"
@@ -201,7 +201,7 @@ async def test_a_failed_reprice_produces_no_quote():
     ctx = AgentContext(org_id=ORG)
     ctx.tool_calls.append(ToolCall(name="refresh_hotel_price", args={},
                                    result={"error": "Transaction Id should be UUID"}))
-    assert HotelSearchAgent().build_blocks(ctx) is None
+    assert HotelSearchAgent().build_blocks(ctx, ctx.tool_calls) is None
 
 
 @pytest.mark.asyncio
@@ -261,7 +261,7 @@ def test_raw_json_is_never_placed_in_the_answer():
     from agents.hotel_search_agent import HotelSearchAgent
     ctx = AgentContext(org_id=ORG)
     ctx.tool_calls.append(search_call())
-    blocks = HotelSearchAgent().build_blocks(ctx)
+    blocks = HotelSearchAgent().build_blocks(ctx, ctx.tool_calls)
     result = AgentRunResult(output="Two options; the first is cheapest.",
                             verification=VerificationResult(), context=ctx,
                             messages=[], blocks=blocks)

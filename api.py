@@ -30,7 +30,7 @@ from agents.hotel_search_agent import HotelSearchAgent
 from agents.ops_triage_agent import OpsTriageAgent
 from config import get_settings
 from memory import build_memory
-from runtime import AgentContext, build_llm, delegate, trim_history
+from runtime import AgentContext, build_llm, delegate, trim_history, user_facing_error
 from blocks import blocks_to_model, sources_from_tool_calls
 from web_tools import index_stats, search_enrichment
 
@@ -199,7 +199,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
             **({"sources": _sources} if (_sources := sources_from_tool_calls(
                 session.ctx.tool_calls[before:])) else {}),
             "verification": {"passed": result.verification.passed,
-                             "issues": result.verification.issues},
+                             "issues": result.verification.issues,
+                             "notes": result.verification.notes},
             "tools_called": [c.name for c in session.ctx.tool_calls[before:]],
             "tools_called_session": [c.name for c in session.ctx.tool_calls],
             "memory": session.ctx.recall_all(),
@@ -211,7 +212,9 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         record_turn(session_id=session_id, agent=agent_key, model=req.model,
                     error=f"{type(exc).__name__}: {exc}"[:300],
                     message_chars=len(req.message))
-        return {"error": f"{type(exc).__name__}: {exc}", "session_id": session_id}
+        # Logged in full above by logger.exception; the reader gets the one
+        # sentence they can act on.
+        return {"error": user_facing_error(exc), "session_id": session_id}
 
 
 @app.get("/memory")
@@ -318,7 +321,7 @@ async def delegate_view(req: DelegateRequest) -> dict[str, Any]:
         }
     except Exception as exc:
         logger.exception("delegate failed")
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"error": user_facing_error(exc)}
 
 
 @app.get("/health")

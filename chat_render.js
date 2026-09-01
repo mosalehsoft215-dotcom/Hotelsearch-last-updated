@@ -114,6 +114,17 @@
   var isUl = function (line) { return /^[-*+]\s+/.test(line); };
   var isOl = function (line) { return /^\d+\.\s+/.test(line); };
 
+  /* A line that reads as a table row: at least two pipe-separated cells, and
+     not something that is already another block. Used to recover a table whose
+     separator row the model forgot — without it those lines fell through to a
+     paragraph and the reader saw the pipes. */
+  function rowCells(line) {
+    if (!line || line.indexOf('|') === -1) return null;
+    if (isUl(line) || isOl(line) || /^#{1,6}\s/.test(line) || /^>/.test(line)) return null;
+    var cells = splitRow(line);
+    return cells.length >= 2 ? cells : null;
+  }
+
   function renderMarkdown(source, doc) {
     doc = doc || root.document;
     var out = el(doc, 'div', 'md');
@@ -196,6 +207,26 @@
         continue;
       }
 
+      /* No separator row, but two or more consecutive lines of the same width:
+         treat the first as the header. Two lines minimum, so a sentence that
+         happens to contain a pipe stays a sentence. */
+      var headerCells = rowCells(line);
+      if (headerCells && i + 1 < lines.length) {
+        var nextCells = rowCells(lines[i + 1].trim());
+        if (nextCells && nextCells.length === headerCells.length) {
+          flushPara();
+          i += 1;
+          var loose = [];
+          while (i < lines.length) {
+            var c = rowCells(lines[i].trim());
+            if (!c) break;
+            loose.push(c); i++;
+          }
+          out.appendChild(tableNode(doc, headerCells, loose, 'md-table'));
+          continue;
+        }
+      }
+
       if (isUl(line) || isOl(line)) {
         flushPara();
         var ordered = isOl(line);
@@ -233,9 +264,16 @@
     });
     thead.appendChild(hrow);
     var tbody = el(doc, 'tbody');
+    /* Every row is squared to the header width. A model that writes three
+       headers and two cells produced a table whose columns did not line up
+       under them; padding is the difference between a thin row and a broken
+       one, and an extra cell has no header to sit under. */
+    var width = (columns || []).length;
     (rows || []).forEach(function (r) {
       var tr = el(doc, 'tr');
-      (r || []).forEach(function (c) {
+      var cells = Array.isArray(r) ? r.slice(0, width || undefined) : [];
+      while (width && cells.length < width) cells.push('');
+      cells.forEach(function (c) {
         var td = el(doc, 'td');
         td.appendChild(inlineFragment(doc, c == null ? '' : c));
         tr.appendChild(td);

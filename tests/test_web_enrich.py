@@ -143,7 +143,12 @@ async def test_weather_comes_from_the_forecast_api_as_numbers():
     fields = {c.field_name: c.value for c in claims}
     assert fields["place"] == "Jeddah, Saudi Arabia"
     assert fields["forecast_2026-09-01"] == "29–38°C, 0 mm rain"
-    assert all(c.sources[0].tier == "official" for c in claims)
+    # A forecast API is a third party. "official" in this tier list means the
+    # subject's own site, and "gov" a recognised authority; a weather vendor is
+    # neither, and calling it official is what put the word in front of a reader.
+    assert all(c.sources[0].tier == "other" for c in claims)
+    assert all(c.sources[0].title == "Open-Meteo forecast" for c in claims)
+    assert all(c.authority == "third_party" for c in claims)
 
 
 @pytest.mark.asyncio

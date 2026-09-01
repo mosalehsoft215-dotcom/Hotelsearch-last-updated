@@ -334,3 +334,51 @@ test('a source with an unsafe url is shown as text, never as a link', () => {
   assert.equal(tagsIn(frag, 'a').length, 0);
   assert.ok(textOf(frag).includes('evil'));
 });
+
+/* --- malformed markdown tables ------------------------------------------- */
+
+test('a pipe table with no separator row is still a table, not literal pipes', () => {
+  const out = md('| Hotel | Price |\n| Alpha | 300 USD |\n| Beta | 320 USD |');
+  assert.equal(tagsIn(out, 'table').length, 1);
+  assert.deepEqual(tagsIn(out, 'th').map(textOf), ['Hotel', 'Price']);
+  assert.deepEqual(tagsIn(out, 'td').map(textOf),
+                   ['Alpha', '300 USD', 'Beta', '320 USD']);
+  assert.ok(!html(out).includes('|'), 'no literal pipes may survive');
+});
+
+test('rows are squared to the header so columns cannot shear', () => {
+  const short = md('| A | B | C |\n|---|---|---|\n| 1 | 2 |');
+  assert.equal(tagsIn(short, 'th').length, 3);
+  assert.deepEqual(tagsIn(short, 'td').map(textOf), ['1', '2', ''], 'padded');
+
+  const long = md('| A | B |\n|---|---|\n| 1 | 2 | 3 |');
+  assert.equal(tagsIn(long, 'th').length, 2);
+  assert.deepEqual(tagsIn(long, 'td').map(textOf), ['1', '2'], 'a cell with no header is dropped');
+});
+
+test('one line with a pipe stays a sentence', () => {
+  const out = md('The total | including tax | is 300 USD.');
+  assert.equal(tagsIn(out, 'table').length, 0);
+  assert.ok(textOf(out).includes('The total | including tax | is 300 USD.'));
+});
+
+test('a bullet list whose items contain pipes stays a list', () => {
+  const out = md('- Alpha | 300 USD\n- Beta | 320 USD');
+  assert.equal(tagsIn(out, 'table').length, 0);
+  assert.equal(tagsIn(out, 'ul').length, 1);
+  assert.equal(tagsIn(out, 'li').length, 2);
+});
+
+test('a heading above a table does not become a table row', () => {
+  const out = md('## Options\n| Hotel | Price |\n| Alpha | 300 |');
+  assert.equal(tagsIn(out, 'h4').length, 1);
+  assert.equal(tagsIn(out, 'table').length, 1);
+  assert.deepEqual(tagsIn(out, 'th').map(textOf), ['Hotel', 'Price']);
+});
+
+test('a table block prefers the structured renderer and squares its rows too', () => {
+  const out = R.renderBlocks([{ type: 'table', columns: ['Hotel', 'Total'],
+                                rows: [['Alpha'], ['Beta', 320, 'extra']] }], doc);
+  assert.equal(tagsIn(out, 'table').length, 1);
+  assert.deepEqual(tagsIn(out, 'td').map(textOf), ['Alpha', '', 'Beta', '320']);
+});

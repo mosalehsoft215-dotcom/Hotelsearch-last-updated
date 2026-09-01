@@ -85,6 +85,9 @@
   .badge{padding:2px 9px;border-radius:20px;font-weight:600;border:1px solid var(--line)}
   .badge.ok{color:var(--ok);border-color:#37d67a44;background:#37d67a12}
   .badge.bad{color:var(--bad);border-color:#ff6b6b44;background:#ff6b6b12}
+  /* Neither green nor red: the answer is true, something about how it reads is
+     worth saying. */
+  .badge.note{color:var(--muted);font-weight:500;background:#8a93a612}
   .chip{padding:2px 9px;border-radius:20px;background:var(--chip);border:1px solid var(--line);color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11px}
   .empty{color:var(--muted);text-align:center;margin-top:8vh}
   .empty h2{color:var(--ink);font-weight:700;margin:0 0 6px}
@@ -305,21 +308,30 @@
     // always uvicorn restarting under --reload, or stopped, while the page stayed open.
     if(/failed to fetch|networkerror|load failed/i.test(raw))
       return "Can't reach the server. Check that uvicorn is still running on this port, then try again.";
-    return raw.length > 240 ? raw.slice(0, 240) + "…" : raw;
+    if(/\b(408|429|5\d\d)\b|rate.?limit|timed?.?out|temporarily|overloaded|capacity|unavailable/i.test(raw))
+      return "The model provider is busy or briefly unavailable. Send that again in a moment, or pick another model from the dropdown above.";
+    /* The fallback used to echo the raw text, which is how a provider's own
+       "HTTP 503: {…}" body reached the chat window. Keep it for whoever is
+       debugging, in the console, and tell the reader something useful. */
+    if(raw) console.warn("[chat] unhandled error:", raw);
+    return "Something went wrong handling that message. Try again, or pick another model from the dropdown above.";
   }
 
   // One builder for both a normal reply and a handover. Nodes, not markup — the
   // issue strings and tool names are ours today, and this stops caring tomorrow.
-  function metaRow(passed, issues, tools){
+  function metaRow(passed, issues, tools, notes){
     const m=el("div","meta");
     m.appendChild(passed ? el("span","badge ok","verified")
                          : el("span","badge bad",(issues||[]).join("; ") || "not verified"));
     (tools||[]).forEach(t => m.appendChild(el("span","chip", t)));
+    /* Separate from the badge on purpose: a note is about how the answer reads,
+       not about whether it is true. Same row, plainly different weight. */
+    (notes||[]).forEach(n => m.appendChild(el("span","badge note", n)));
     return m;
   }
   function meta(after, data){
     const v=data.verification||{};
-    after.parentElement.appendChild(metaRow(v.passed, v.issues, data.tools_called));
+    after.parentElement.appendChild(metaRow(v.passed, v.issues, data.tools_called, v.notes));
   }
 
   const mem = document.getElementById("mem");

@@ -660,7 +660,12 @@ class OpenMeteo:
         days = daily.get("time") or []
         if not days:
             return []
-        source = Source(url=str(forecast.url), title="Open-Meteo forecast", tier="official")
+        # Not "official". A forecast API is a third party, and "official" in this
+        # tier list means the subject's own site — reserving it, and `gov`, for
+        # bodies that actually speak for the thing. Letting source_tier read the
+        # host gives "other", which is what api.open-meteo.com is.
+        source = Source(url=str(forecast.url), title="Open-Meteo forecast",
+                        tier=source_tier(str(forecast.url)))
         highs = daily.get("temperature_2m_max") or []
         lows = daily.get("temperature_2m_min") or []
         rain = daily.get("precipitation_sum") or []
