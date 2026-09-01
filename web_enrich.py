@@ -26,7 +26,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlparse
 
@@ -34,7 +34,11 @@ SCHEMA_VERSION = "2"
 
 HOTEL_DOMAINS = ("reputation", "location", "facilities", "risk")
 DESTINATION_DOMAINS = ("weather", "advisory", "news")
-DOMAINS = HOTEL_DOMAINS + DESTINATION_DOMAINS
+COMPANY_DOMAINS = ("company_facts",)
+AGENCY_DOMAINS = ("agency_facts",)
+DOMAINS = HOTEL_DOMAINS + DESTINATION_DOMAINS + COMPANY_DOMAINS + AGENCY_DOMAINS
+
+ENTITY_TYPES = ("hotel", "city", "company", "agency")
 
 # How long an answer stays usable before it should be fetched again. Nothing here
 # runs on a timer — a caller asks, and this decides whether the cached answer is
@@ -47,7 +51,83 @@ FRESH_FOR_SECONDS = {
     "reputation": 7 * 24 * 3600,
     "location": 30 * 24 * 3600,
     "facilities": 30 * 24 * 3600,
+    # Registration facts move on the scale of a filing, not a news cycle. A
+    # month is long enough that nobody refetches them for fun and short enough
+    # that a change of owner or CEO is not carried for a year.
+    "company_facts": 30 * 24 * 3600,
+    "agency_facts": 30 * 24 * 3600,
 }
+
+# The only fields these two domains may report. Anything else a source offers is
+# dropped rather than passed along: the point of a fixed schema here is that a
+# question about a field nobody fetched comes back as "not verified" instead of
+# being answered from whatever the model happens to believe.
+FIELD_SCHEMA = {
+    "company_facts": ("legal_name", "parent_company_or_owner", "headquarters",
+                      "founded", "official_website", "ceo"),
+    "agency_facts": ("legal_or_trading_name", "country", "headquarters_or_address",
+                     "official_website", "contact_phone", "contact_email",
+                     "accreditation_or_licence"),
+}
+
+# Sources name the same field a dozen ways. Mapping them in is the difference
+# between a populated record and an empty one that "found nothing".
+FIELD_ALIASES = {
+    "company_facts": {
+        "name": "legal_name", "company": "legal_name", "company_name": "legal_name",
+        "official_name": "legal_name", "registered_name": "legal_name",
+        "legal_entity": "legal_name",
+        "parent": "parent_company_or_owner", "parent_company": "parent_company_or_owner",
+        "owner": "parent_company_or_owner", "owned_by": "parent_company_or_owner",
+        "ownership": "parent_company_or_owner", "group": "parent_company_or_owner",
+        "hq": "headquarters", "head_office": "headquarters", "headquarter": "headquarters",
+        "headquarters_location": "headquarters", "based_in": "headquarters",
+        "founded_in": "founded", "founded_year": "founded", "inception": "founded",
+        "established": "founded", "year_founded": "founded", "founding_date": "founded",
+        "website": "official_website", "site": "official_website",
+        "url": "official_website", "homepage": "official_website",
+        "chief_executive": "ceo", "chief_executive_officer": "ceo",
+        "chief_exec": "ceo", "managing_director": "ceo",
+    },
+    "agency_facts": {
+        "name": "legal_or_trading_name", "agency": "legal_or_trading_name",
+        "agency_name": "legal_or_trading_name", "trading_name": "legal_or_trading_name",
+        "legal_name": "legal_or_trading_name", "company_name": "legal_or_trading_name",
+        "official_name": "legal_or_trading_name",
+        "based_in": "country", "registered_country": "country", "nation": "country",
+        "address": "headquarters_or_address", "hq": "headquarters_or_address",
+        "headquarters": "headquarters_or_address", "head_office": "headquarters_or_address",
+        "office": "headquarters_or_address", "location": "headquarters_or_address",
+        "website": "official_website", "site": "official_website",
+        "url": "official_website", "homepage": "official_website",
+        "phone": "contact_phone", "telephone": "contact_phone", "tel": "contact_phone",
+        "contact_number": "contact_phone", "contact": "contact_phone",
+        "email": "contact_email", "e_mail": "contact_email",
+        "contact_e_mail": "contact_email",
+        "licence": "accreditation_or_licence", "license": "accreditation_or_licence",
+        "iata": "accreditation_or_licence", "iata_number": "accreditation_or_licence",
+        "accreditation": "accreditation_or_licence", "atol": "accreditation_or_licence",
+        "registration": "accreditation_or_licence", "licence_number": "accreditation_or_licence",
+    },
+}
+
+# Fields nobody may report on a stranger's say-so. A CEO named by a travel blog
+# is a rumour; a licence number quoted by an aggregator is worse, because it
+# looks like something a customer could rely on. These are dropped unless the
+# claim carries an authoritative source, and named in `not_verified` so the
+# answer can say the field was not confirmed rather than go quiet.
+VERIFIED_ONLY_FIELDS = {
+    "company_facts": frozenset({"ceo"}),
+    "agency_facts": frozenset({"contact_phone", "contact_email",
+                               "accreditation_or_licence"}),
+}
+
+# Where a claim's authority comes from.
+#   government       a state or recognised official authority
+#   entity_official  the subject's own website
+#   reference_backed a structured record that cites its own source
+#   third_party      everything else, which is most of the web
+AUTHORITATIVE = frozenset({"government", "entity_official", "reference_backed"})
 
 # Who to believe first when two pages disagree.
 TIER_ORDER = ("official", "gov", "maps", "reviews", "news", "other")
@@ -55,10 +135,80 @@ _TIER_HOSTS = {
     "maps": ("google.com/maps", "maps.google", "openstreetmap.org"),
     "reviews": ("booking.com", "tripadvisor.", "agoda.com", "expedia.", "hotels.com",
                 "trivago.", "kayak.", "trustpilot."),
-    "gov": (".gov", ".gov.uk", "gov.au", "travel.state.gov", "canada.ca"),
     "news": ("reuters.com", "apnews.com", "bbc.co", "aljazeera.", "arabnews.com",
              "gulfnews.com", "saudigazette."),
 }
+
+# The suffixes a state actually publishes under. Matched as whole labels at the
+# end of the host, never as a substring: "gov.uk.travel-deals.com" contains
+# ".gov.uk" and is a travel site, and the old tier check — which searched for
+# ".gov" anywhere in host+path — called it government. That is a fine way to
+# rank a page and a bad way to decide whether a warning is official.
+_GOV_SUFFIXES = frozenset({
+    "gov", "mil", "gov.uk", "gov.au", "gov.sa", "gov.ae", "gov.eg", "gov.in",
+    "gov.sg", "gov.za", "gov.br", "gov.it", "gov.pl", "gov.gr", "gov.ie",
+    "gov.qa", "gov.kw", "gov.bh", "gov.om", "gov.jo", "gov.tr", "gov.my",
+    "gov.hk", "gov.cn", "gov.pt", "gov.il", "gov.pk", "gov.ng", "gov.ke",
+    "go.jp", "go.kr", "go.id", "go.th", "gouv.fr", "gc.ca", "gob.es", "gob.mx",
+    "govt.nz", "admin.ch", "bund.de", "overheid.nl",
+})
+
+# Recognised official authorities that publish outside a government suffix.
+# Kept short and specific on purpose — every entry is a body whose travel or
+# safety guidance is the primary source, not a report about one.
+_OFFICIAL_HOSTS = frozenset({
+    "canada.ca", "travel.gc.ca", "international.gc.ca", "smartraveller.gov.au",
+    "europa.eu", "ec.europa.eu", "who.int", "un.org", "icao.int", "unesco.org",
+    "iata.org", "reopen.europa.eu", "auswaertiges-amt.de", "esta.cbp.dhs.gov",
+})
+
+
+def _host_of(url: str) -> str:
+    parsed = urlparse(url if "//" in (url or "") else f"//{url or ''}")
+    return (parsed.netloc or "").lower().split("@")[-1].split(":")[0].strip(".")
+
+
+def is_government_source(url: str) -> bool:
+    """Whether a page is published by a state or a recognised official authority.
+
+    This is the gate on the phrase "official travel advisory", so it reads the
+    host structurally — the last labels of the domain — rather than looking for
+    "gov" somewhere in the string. A news write-up about an advisory is not the
+    advisory, however well it quotes it.
+    """
+    host = _host_of(url)
+    if not host:
+        return False
+    if host in _OFFICIAL_HOSTS or any(host.endswith(f".{h}") for h in _OFFICIAL_HOSTS):
+        return True
+    labels = host.split(".")
+    return any(".".join(labels[-n:]) in _GOV_SUFFIXES for n in (1, 2))
+
+
+def is_entity_site(url: str, official_domains: Iterable[str]) -> bool:
+    """Whether a page is on the subject's own domain. `official_domains` may be
+    given as a bare host or as a full url, since callers supply both."""
+    host = _host_of(url)
+    if not host:
+        return False
+    for own in official_domains:
+        own_host = _host_of(own) or (own or "").lower().strip().strip("/")
+        own_host = own_host.removeprefix("www.")
+        if own_host and (host == own_host or host.endswith(f".{own_host}")):
+            return True
+    return False
+
+
+def classify_authority(claim: "Claim", official_domains: Iterable[str] = ()) -> str:
+    """Upgrade a claim's authority from what its sources are, keeping whatever
+    the provider already established — a Wikidata statement that cites its own
+    reference stays reference_backed even though wikidata.org is nobody's
+    government."""
+    if any(is_government_source(s.url) for s in claim.sources):
+        return "government"
+    if any(is_entity_site(s.url, official_domains) for s in claim.sources):
+        return "entity_official"
+    return claim.authority
 
 # re.I as a flag, not inline (?i) repeated per branch. Python 3.11 turned a
 # mid-pattern global flag into re.error ("global flags not at the start of the
@@ -93,6 +243,8 @@ def source_tier(url: str, subject_domains: Iterable[str] = ()) -> str:
     for own in subject_domains:
         if own and own.lower() in host:
             return "official"
+    if is_government_source(url):
+        return "gov"
     for tier, needles in _TIER_HOSTS.items():
         if any(needle in host for needle in needles):
             return tier
@@ -120,6 +272,13 @@ class Claim:
     observed_at: datetime = field(default_factory=_now)
     status: str = "unverified"      # corroborated | single_source | conflicting
     conflicts_with: list[str] = field(default_factory=list)
+    # Who stands behind the claim, as opposed to how many pages repeat it.
+    # Corroboration counts sources; this ranks them.
+    authority: str = "third_party"
+
+    @property
+    def is_authoritative(self) -> bool:
+        return self.authority in AUTHORITATIVE
 
     @property
     def hosts(self) -> set[str]:
@@ -141,6 +300,10 @@ class Enrichment:
     providers_tried: list[str] = field(default_factory=list)
     note: str | None = None
     fetched_at: datetime = field(default_factory=_now)
+    # What the domain's own rules made of the result: which fields came back
+    # unconfirmed, which the schema does not carry, and — for advisories —
+    # whether a government actually said it.
+    checks: dict[str, Any] = field(default_factory=dict)
 
     def to_model(self) -> dict[str, Any]:
         """What an agent is allowed to see. Every claim keeps its sources and its
@@ -151,9 +314,14 @@ class Enrichment:
             by_field[claim.field_name].append({
                 "value": claim.value,
                 "status": claim.status,
+                "authority": claim.authority,
+                "verified": claim.is_authoritative,
                 "sources": [{"url": s.url, "title": s.title, "tier": s.tier}
                             for s in claim.sources],
                 "observed_at": claim.observed_at.isoformat(),
+                "valid_until": (claim.observed_at + timedelta(
+                    seconds=FRESH_FOR_SECONDS[self.domain])).isoformat()
+                    if self.domain in FRESH_FOR_SECONDS else None,
             })
         return {
             "subject": self.subject,
@@ -166,6 +334,7 @@ class Enrichment:
             "disagreements": [
                 {"field": c.field_name, "value": c.value, "conflicts_with": c.conflicts_with}
                 for c in self.claims if c.status == "conflicting"],
+            "checks": self.checks,
             "note": self.note,
             "usage": ("Third-party content, not supplier data. Quote a claim only with "
                       "its source and its status. Never use it for price, availability "
@@ -204,6 +373,93 @@ def assess(claims: list[Claim]) -> list[Claim]:
                 claim.status = "single_source"
         settled.extend(variants)
     return settled
+
+
+def canonical_field(domain: str, name: str) -> str | None:
+    """The schema name for what a source called this, or None if the domain does
+    not carry it. Domains without a fixed schema keep whatever name they were
+    given — only company and agency facts are closed sets."""
+    schema = FIELD_SCHEMA.get(domain)
+    if schema is None:
+        return name
+    tidy = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    if tidy in schema:
+        return tidy
+    return FIELD_ALIASES.get(domain, {}).get(tidy)
+
+
+def validate_claims(domain: str, claims: list[Claim],
+                    context: dict[str, Any] | None = None) -> tuple[list[Claim], dict[str, Any]]:
+    """Apply the domain's own rules and report what they cost.
+
+    Three things happen here that `assess` cannot do, because assess only counts
+    how many pages repeat a value and never asks who published them:
+
+    * a closed-schema domain drops fields it does not carry, so a question about
+      one is answered "not verified" instead of from the model's own memory;
+    * a field that may not be taken on trust is dropped unless its source is
+      authoritative, and named rather than silently missing;
+    * an advisory is only official when a government published it.
+    """
+    context = context or {}
+    official_domains = [d for d in (context.get("official_domains") or []) if d]
+    # A confirmed official_website makes the subject's own pages authoritative
+    # for the rest of the record. Without this the site is found and then not
+    # used, and a fact quoted from the company's own About page ranks the same
+    # as one from a directory.
+    for claim in claims:
+        if canonical_field(domain, claim.field_name) == "official_website":
+            official_domains.append(claim.value)
+
+    for claim in claims:
+        claim.authority = classify_authority(claim, official_domains)
+
+    checks: dict[str, Any] = {}
+    schema = FIELD_SCHEMA.get(domain)
+    if schema is None:
+        kept = claims
+    else:
+        kept, ignored, unverified = [], [], []
+        for claim in claims:
+            name = canonical_field(domain, claim.field_name)
+            if name is None:
+                ignored.append(claim.field_name)
+                continue
+            claim.field_name = name
+            if name in VERIFIED_ONLY_FIELDS.get(domain, ()) and not claim.is_authoritative:
+                unverified.append(name)
+                continue
+            kept.append(claim)
+        present = {c.field_name for c in kept}
+        checks["schema"] = list(schema)
+        checks["fields_present"] = sorted(present)
+        checks["not_verified"] = sorted(set(unverified) - present)
+        checks["missing"] = [f for f in schema if f not in present]
+        checks["fields_outside_schema"] = sorted(set(ignored))
+
+    if domain == "advisory":
+        official = [c for c in kept if c.authority == "government"]
+        checks["official_advisory_verified"] = bool(official)
+        checks["official_sources"] = sorted({s.url for c in official for s in c.sources})
+        checks["unofficial_claims"] = sorted({c.field_name for c in kept
+                                              if c.authority != "government"})
+    return kept, checks
+
+
+def unverified_note(domain: str, checks: dict[str, Any]) -> str | None:
+    """What to say about the fields that did not come back confirmed. Silence
+    reads as "nothing to report", which is the one thing it must not mean."""
+    parts: list[str] = []
+    if checks.get("not_verified"):
+        parts.append("no authoritative source for " + ", ".join(checks["not_verified"])
+                     + " — report these as not verified rather than from memory")
+    if checks.get("missing"):
+        parts.append("not found: " + ", ".join(checks["missing"]))
+    if domain == "advisory" and checks.get("official_advisory_verified") is False:
+        parts.append("no official advisory was verified: nothing here was published by "
+                     "a government or recognised official authority, so this must not "
+                     "be called an official government travel advisory")
+    return "; ".join(parts) or None
 
 
 _NUMBERS = re.compile(r"\d+(?:[.,]\d+)?")
@@ -254,6 +510,15 @@ _WANTED = {
     "advisory": ("the current government travel advice for this destination and when it "
                  "was last updated"),
     "news": ("anything in the last month that would affect a traveller going there"),
+    "company_facts": ("the registered legal name, who owns it or its parent group, where "
+                      "it is headquartered, the year it was founded, its own website, and "
+                      "the current chief executive — the last only from the company's own "
+                      "site or a company register, never from a news profile"),
+    "agency_facts": ("the registered or trading name of this travel agency, its country, "
+                     "its head office address, its own website, its published phone and "
+                     "email, and any accreditation or licence number such as IATA or ATOL "
+                     "— contact details and licence only from the agency's own site or a "
+                     "regulator, never from a directory"),
 }
 _FIELDS = {
     "reputation": "guest_rating, review_count, praised_for, complained_about",
@@ -262,6 +527,8 @@ _FIELDS = {
     "risk": "renovation, closure, construction, ownership, brand",
     "advisory": "advisory_level, advisory_updated, guidance",
     "news": "headline, published, relevance",
+    "company_facts": ", ".join(FIELD_SCHEMA["company_facts"]),
+    "agency_facts": ", ".join(FIELD_SCHEMA["agency_facts"]),
 }
 
 
@@ -428,6 +695,153 @@ class OpenMeteo:
         return claims
 
 
+class WikidataFacts:
+    """Company and agency registration facts, from a structured record.
+
+    The same argument as Open-Meteo for weather: a fact with a number or a
+    registered name in it should come from a database, not from a model's
+    recollection of one. Wikidata is free, needs no key, and every statement
+    carries its own references — which is what makes "ceo only when verified"
+    a rule rather than a hope. Confirmed live: Accor's chief executive carries a
+    reference and is reported; Hilton's and Marriott's carry none and are not.
+
+    Two things it will not do. It does not invent a match — a search that
+    returns nothing returns nothing. And it skips deprecated statements, which
+    matter here: Hilton's `owned by` is deprecated on Wikidata and reading it
+    would have named an owner that stopped being true in 2013.
+    """
+    name = "wikidata"
+    SEARCH = "https://www.wikidata.org/w/api.php"
+    ENTITY = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+    PAGE = "https://www.wikidata.org/wiki/{qid}"
+
+    # Wikimedia answers an anonymous client with 403. A descriptive agent is
+    # their published condition of use, not a nicety.
+    _UA = ("hotels-mcp-enrichment/1.0 "
+           "(https://github.com/mosalehsoft215-dotcom/Hotelsearch-last-updated) httpx")
+
+    _PROPS = {
+        "company_facts": {
+            "P1448": "legal_name", "P749": "parent_company_or_owner",
+            "P127": "parent_company_or_owner", "P159": "headquarters",
+            "P571": "founded", "P856": "official_website", "P169": "ceo",
+        },
+        "agency_facts": {
+            "P1448": "legal_or_trading_name", "P17": "country",
+            "P159": "headquarters_or_address", "P856": "official_website",
+        },
+    }
+
+    def __init__(self, timeout: float = 20.0, transport: Any = None) -> None:
+        import httpx
+        self._client = httpx.AsyncClient(timeout=timeout, transport=transport,
+                                         headers={"User-Agent": self._UA},
+                                         follow_redirects=True)
+
+    def handles(self, domain: str) -> bool:
+        return domain in self._PROPS
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        response = await self._client.get(url, params=params)
+        if response.status_code >= 400:
+            raise ProviderUnavailable(f"wikidata HTTP {response.status_code}")
+        try:
+            return response.json() or {}
+        except ValueError as exc:
+            raise ProviderUnavailable(f"wikidata: {exc}") from exc
+
+    async def _labels(self, qids: list[str]) -> dict[str, str]:
+        """One call for every item value in the record, rather than one each."""
+        if not qids:
+            return {}
+        payload = await self._get(self.SEARCH, {
+            "action": "wbgetentities", "ids": "|".join(sorted(set(qids))[:40]),
+            "props": "labels", "languages": "en", "format": "json"})
+        return {qid: (entity.get("labels", {}).get("en", {}) or {}).get("value", "")
+                for qid, entity in (payload.get("entities") or {}).items()}
+
+    @staticmethod
+    def _render(value: Any) -> tuple[str, str | None]:
+        """A statement's value as text, plus the item id it needs a label for."""
+        if isinstance(value, str):
+            return value, None
+        if not isinstance(value, dict):
+            return "", None
+        if "id" in value and value.get("entity-type") == "item":
+            return "", value["id"]
+        if "time" in value:                       # +1919-00-00T00:00:00Z
+            stamp = str(value["time"]).lstrip("+")
+            precision = value.get("precision", 11)
+            return (stamp[:4] if precision <= 9 else
+                    stamp[:7] if precision == 10 else stamp[:10]), None
+        if "text" in value:                       # monolingual text
+            return str(value["text"]), None
+        if "amount" in value:
+            return str(value["amount"]).lstrip("+"), None
+        return "", None
+
+    async def fetch(self, subject: str, domain: str, context: dict[str, Any]) -> list[Claim]:
+        wanted = self._PROPS[domain]
+        qid = context.get("wikidata_id")
+        if not qid:
+            found = await self._get(self.SEARCH, {
+                "action": "wbsearchentities", "search": subject, "language": "en",
+                "format": "json", "limit": 1, "type": "item"})
+            hits = found.get("search") or []
+            if not hits:
+                return []
+            qid = hits[0]["id"]
+        payload = await self._get(self.ENTITY.format(qid=qid))
+        entity = (payload.get("entities") or {}).get(qid) or {}
+        statements = entity.get("claims") or {}
+
+        # Read once to collect the item ids, resolve their labels in one call,
+        # then read again to build the claims.
+        chosen: list[tuple[str, dict[str, Any]]] = []
+        for prop, field_name in wanted.items():
+            for statement in statements.get(prop) or []:
+                if statement.get("rank") == "deprecated":
+                    continue
+                chosen.append((field_name, statement))
+        pending: list[str] = []
+        for _, statement in chosen:
+            _, item = self._render(statement.get("mainsnak", {})
+                                   .get("datavalue", {}).get("value"))
+            if item:
+                pending.append(item)
+        labels = await self._labels(pending)
+
+        page = self.PAGE.format(qid=qid)
+        claims: list[Claim] = []
+        for field_name, statement in chosen:
+            raw = statement.get("mainsnak", {}).get("datavalue", {}).get("value")
+            text, item = self._render(raw)
+            if item:
+                text = labels.get(item, "")
+            text = neutralise(text, limit=200)
+            if not text or MONEY.search(text):
+                continue
+            # A statement that cites nothing is Wikidata's own assertion. That
+            # is enough for a founding year and not enough to name a serving
+            # chief executive, which is exactly the distinction the schema's
+            # verified-only fields draw.
+            cited = bool(statement.get("references"))
+            claims.append(Claim(
+                domain=domain, field_name=field_name, value=text, provider=self.name,
+                authority="reference_backed" if cited else "third_party",
+                sources=[Source(url=page, title=f"Wikidata {qid}", tier="other")]))
+        # The subject's own site, once known, is the strongest source it has.
+        for claim in claims:
+            if claim.field_name == "official_website":
+                claim.sources.append(Source(url=claim.value, title="official website",
+                                            tier="official"))
+                claim.authority = "entity_official"
+        return claims
+
+
 class PlaywrightPage:
     """Reads one page with a real browser, for the sites that render nothing
     without JavaScript. Off unless a browser is installed — this is the heavy
@@ -554,12 +968,20 @@ class Enricher:
             if len(claims) >= 3:      # enough to answer; stop spending
                 break
 
-        result = Enrichment(subject=subject, domain=domain, claims=assess(claims),
+        # assess() counts how many pages repeat a value; validate_claims() asks
+        # who published them and whether the domain carries the field at all.
+        kept, checks = validate_claims(domain, assess(claims), context)
+        result = Enrichment(subject=subject, domain=domain, claims=kept,
                             providers_tried=tried, entity_type=entity_type,
-                            entity_ref=entity_ref or subject)
+                            entity_ref=entity_ref or subject, checks=checks)
+        gaps = unverified_note(domain, checks)
         if not result.claims:
             result.note = ("; ".join(failures) if failures
                            else "nothing solid found for this subject")
+            if gaps:
+                result.note = f"{result.note}; {gaps}"
+        elif gaps:
+            result.note = gaps
         if use_cache:
             self.cache.put(key, result)
         if self.index is not None and result.claims:
@@ -576,6 +998,8 @@ def build_providers(settings: Any) -> list[Provider]:
     providers: list[Provider] = []
     if getattr(settings, "web_openmeteo_enabled", True):
         providers.append(OpenMeteo())
+    if getattr(settings, "web_wikidata_enabled", True):
+        providers.append(WikidataFacts())
     if (getattr(settings, "web_search_backend", "none") == "openrouter"
             and settings.openrouter_api_key):
         providers.append(OpenRouterWeb(api_key=settings.openrouter_api_key,

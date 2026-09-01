@@ -61,6 +61,12 @@ DOMAIN_WORDS = {
     "advisory": "advisory advice travel warning safety security government "
                 "guidance restrictions entry",
     "news": "news recent events happening reported story update",
+    "company_facts": "company corporate chain brand group owner owns owned ownership "
+                     "parent subsidiary headquarters headquartered based legal name "
+                     "founded established incorporated ceo chief executive website",
+    "agency_facts": "agency agent travel operator company trading legal name country "
+                    "headquarters address office website contact phone telephone email "
+                    "accreditation accredited licence license iata atol registration",
 }
 
 
@@ -159,6 +165,36 @@ def mentioned_entities(question: str) -> list[str]:
         # "Carawan Hotel" still wins over its parts.
         singles.extend(words)
     return [*phrases, *singles]
+
+
+def resolve_entity(named: Iterable[str], known_refs: Iterable[str]) -> str | None:
+    """Match what a question calls something to what the index stored it as.
+
+    Exact first. Then on whole words, because a question almost never repeats a
+    registered name in full: "who owns Hilton" against a record stored as
+    "Hilton Worldwide", or "where is Acme Hotels based" — which reduces to the
+    single candidate "Acme", since "hotels" is one of the generic words stripped
+    before matching. Requiring equality meant every multi-word entity was
+    unreachable unless the question spelled it out, and company and agency names
+    are nearly all multi-word.
+
+    Every word of the shorter name must appear in the longer one, so "Aswan"
+    still fails to reach a record about Jeddah — the separation this guard
+    exists for is unaffected.
+    """
+    known = {ref.lower(): ref for ref in sorted(known_refs)}   # sorted: one answer, not any
+    for candidate in named:
+        if candidate.lower() in known:
+            return known[candidate.lower()]
+    for candidate in named:
+        words = set(re.findall(r"[\w']+", candidate.lower()))
+        if not words:
+            continue
+        for lowered, ref in known.items():
+            ref_words = set(re.findall(r"[\w']+", lowered))
+            if ref_words and (words <= ref_words or ref_words <= words):
+                return ref
+    return None
 
 
 _FORECAST_FIELD = re.compile(r"^forecast_(\d{4}-\d{2}-\d{2})$")
@@ -429,11 +465,8 @@ class EnrichmentIndex:
         if entity_ref is None:
             named = mentioned_entities(question)
             if named:
-                known = {ref.lower(): ref for ref in self.store.entity_refs()}
-                matched = [known[n.lower()] for n in named if n.lower() in known]
-                if matched:
-                    entity_ref = matched[0]
-                else:
+                entity_ref = resolve_entity(named, self.store.entity_refs())
+                if entity_ref is None:
                     return []      # asked about something this index has never seen
         # Ask for more than requested, drop what cannot answer, then trim. A
         # forecast for a date already past is dead weight that would otherwise

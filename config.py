@@ -63,6 +63,10 @@ class Settings(BaseSettings):
                                        alias="ENRICHMENT_INDEX_PATH")
     web_openmeteo_enabled: bool = Field(default=True, alias="WEB_OPENMETEO_ENABLED")
     web_playwright_enabled: bool = Field(default=False, alias="WEB_PLAYWRIGHT_ENABLED")
+    # Company and agency facts. Free and keyless, like open-meteo, so it is on
+    # by default — without it those two domains have no provider at all unless
+    # WEB_SEARCH_BACKEND is set.
+    web_wikidata_enabled: bool = Field(default=True, alias="WEB_WIKIDATA_ENABLED")
     web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
     web_search_cache_seconds: int = Field(default=3600, alias="WEB_SEARCH_CACHE_SECONDS")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Per-session agent state: memory, the tool calls made, and a verify result."""
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,9 @@ class AgentContext:
     memory: Any | None = None          # GraphitiMemory — durable, cross-session
     memory_context: str | None = None  # facts pulled at session start
     brief: str | None = None           # set when another agent delegated this work
+    # The user said to answer from what is already stored. Reading the index is
+    # still allowed; going back out to the web is not.
+    stored_only: bool = False
     parent: "AgentContext | None" = field(default=None, repr=False)
     session: SessionMemory = field(default_factory=SessionMemory)
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -60,7 +64,10 @@ class AgentContext:
         """
         return AgentContext(
             org_id=self.org_id, currency=self.currency, nationality=self.nationality,
-            username=self.username, memory=self.memory, brief=brief, parent=self)
+            username=self.username, memory=self.memory, brief=brief, parent=self,
+            # A restriction the user placed on the work travels with the work.
+            # Delegating is not a way round "do not fetch".
+            stored_only=self.stored_only)
 
 
 class VerificationResult:
@@ -353,6 +360,8 @@ _IMPL = {
     "enrich_hotel_info": web_tools.enrich_hotel_info,
     "enrich_destination": web_tools.enrich_destination,
     "search_enrichment": web_tools.search_enrichment,
+    "enrich_company_facts": web_tools.enrich_company_facts,
+    "enrich_agency_facts": web_tools.enrich_agency_facts,
 }
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -516,14 +525,32 @@ TOOL_SPECS.extend([
         "description": "Ask in plain words across everything already fetched about hotels and destinations, without knowing the subject or domain first. Use it before fetching again — it costs nothing and may already hold the answer.",
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string"},
-            "entityType": {"type": "string", "enum": ["hotel", "city"]},
-            "entityRef": {"type": "string", "description": "The hotel or city name."},
+            "entityType": {"type": "string", "enum": ["hotel", "city", "company", "agency"]},
+            "entityRef": {"type": "string", "description": "The hotel, city, company or agency name."},
             "subject": {"type": "string", "description": "Loose match on the subject line."},
             "domain": {"type": "string", "enum": ["reputation", "location", "facilities",
-                       "risk", "weather", "advisory", "news"]},
+                       "risk", "weather", "advisory", "news", "company_facts",
+                       "agency_facts"]},
             "limit": {"type": "integer", "default": 12,
                       "description": "A weather answer is a series of days plus a place line; keep this above the number of nights or one day will be missing from what you see."},
         }, "required": ["question"]}}},
+    {"type": "function", "function": {
+        "name": "enrich_company_facts",
+        "description": "Registration facts about a company — a hotel chain, brand owner or supplier: legal name, parent or owner, headquarters, year founded, official website, and the chief executive when a source stands behind it. The field set is fixed: anything outside it is reported as not carried rather than answered. Never a source of price or availability.",
+        "parameters": {"type": "object", "properties": {
+            "companyName": {"type": "string"},
+            "officialSite": {"type": "string", "description": "The company's own domain, if you already know it. Its own pages then count as an authoritative source for the rest of the record."},
+            "wikidataId": {"type": "string", "description": "A Wikidata item id such as Q1057464, when you know exactly which company is meant and the name alone is ambiguous."},
+        }, "required": ["companyName"]}}},
+    {"type": "function", "function": {
+        "name": "enrich_agency_facts",
+        "description": "Who a travel agency actually is: registered or trading name, country, head office, official website, published contact details, and an accreditation or licence number such as IATA or ATOL. Contact details and licence numbers are only reported from the agency's own site or a regulator — a number copied off a directory comes back as not verified.",
+        "parameters": {"type": "object", "properties": {
+            "agencyName": {"type": "string"},
+            "country": {"type": "string", "description": "Narrows a trading name that several agencies share."},
+            "officialSite": {"type": "string", "description": "The agency's own domain, if you already know it."},
+            "wikidataId": {"type": "string", "description": "A Wikidata item id, when the name alone is ambiguous."},
+        }, "required": ["agencyName"]}}},
     {"type": "function", "function": {
         "name": "remember_preference",
         "description": "Store something the user stated about how they like to travel or book, so it is still known in future sessions. Only call this when the user states a preference — never for search results or supplier data.",
@@ -588,9 +615,61 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+# The tools that go out to the web. search_enrichment is deliberately not one of
+# them: it only reads what a previous fetch already stored, which is precisely
+# what "use stored enrichment only" asks for.
+ENRICHMENT_FETCH_TOOLS = frozenset({
+    "enrich_hotel_info", "enrich_destination",
+    "enrich_company_facts", "enrich_agency_facts",
+})
+
+# Said plainly enough that honouring it is not a judgement call. Anything vaguer
+# is left to the prompt — this list gates a hard refusal, so it holds only
+# phrasings that can mean one thing.
+_STORED_ONLY = re.compile(
+    r"\bus(?:e|ing)\s+(?:only\s+)?(?:the\s+)?(?:stored|existing|cached|indexed|already[- ]"
+    r"(?:fetched|stored))\s+(?:enrichment|data|information|claims|facts)\b"
+    r"|\b(?:stored|existing|cached|indexed)\s+(?:enrichment|data)\s+only\b"
+    r"|\bdo\s*n[o']?t\s+(?:fetch|re-?fetch|refresh|look\s+it\s+up|go\s+online|"
+    r"search\s+the\s+web|use\s+fresh\s+data|use\s+new\s+data|fetch\s+anything\s+new)\b"
+    r"|\b(?:no|without)\s+(?:new\s+)?(?:fetch(?:ing|es)?|re-?fetch(?:ing)?|web\s+"
+    r"(?:search|lookup)|fresh\s+data)\b"
+    r"|\bfrom\s+(?:the\s+)?(?:stored|existing|cached)\s+(?:enrichment|index|data)\s+only\b",
+    re.I)
+
+
+def is_stored_only(message: str) -> bool:
+    """Whether the user ruled out going back to the web for this turn."""
+    return bool(_STORED_ONLY.search(message or ""))
+
+
+class StoredOnlyRefusal(RuntimeError):
+    """A fetch was attempted on a turn the user restricted to stored enrichment."""
+
+
+def stored_only_result(name: str) -> dict[str, Any]:
+    """What the model is told instead of a fetch. It names the one tool that is
+    still open, so the turn continues rather than stalling."""
+    return {
+        "error": f"{name} was not run.",
+        "reason": ("this request said to answer from stored enrichment only, so no "
+                   "tool may go out to the web on this turn"),
+        "allowed": "search_enrichment",
+        "instruction": ("Answer from search_enrichment alone. If the entity, the date "
+                        "or the field asked about is not in what it returns, say it is "
+                        "not available in stored enrichment and stop there — do not "
+                        "answer it from your own knowledge and do not fetch."),
+    }
+
+
 async def dispatch(name: str, args: dict[str, Any] | None, ctx: AgentContext) -> Any:
     if name not in _IMPL:
         raise KeyError(f"tool {name!r} is not available to this agent")
+    # Also enforced in the run loop, which refuses before the call is recorded.
+    # This is the backstop for anything that reaches dispatch another way.
+    if getattr(ctx, "stored_only", False) and name in ENRICHMENT_FETCH_TOOLS:
+        raise StoredOnlyRefusal(
+            f"{name} may not run: this request is restricted to stored enrichment")
     fn = _IMPL[name]
     params = inspect.signature(fn).parameters
     call_args = dict(args or {})
@@ -730,6 +809,14 @@ class AgentBase(ABC):
                   max_iterations: int = 8,
                   history: list[dict[str, Any]] | None = None) -> AgentRunResult:
         specs = specs_for(self.allowed_tools())
+        # Re-read every turn. A chat session reuses one context, so "do not
+        # fetch" on turn 3 must not still be blocking on turn 4. A delegated
+        # child is the exception: it runs once and keeps what its parent was
+        # told, because handing work on is not a way round the restriction.
+        if ctx.brief is None:
+            ctx.stored_only = is_stored_only(user_message)
+        elif is_stored_only(user_message):
+            ctx.stored_only = True
         if ctx.memory is not None and ctx.memory_context is None:
             # one retrieval per session, cached on the context for its lifetime
             ctx.memory_context = await ctx.memory.get_context(
@@ -788,6 +875,16 @@ class AgentBase(ABC):
                             f"arguments for {tc.name} were not valid JSON "
                             f"({tc.invalid_arguments}). Send the call again with "
                             "well-formed JSON arguments.")}),
+                    })
+                    continue
+                # Refused before it runs, and — like the malformed-arguments
+                # case above — not recorded as a tool call, because it never
+                # happened. The model is told which tool is still open so the
+                # turn continues from the index instead of stalling.
+                if ctx.stored_only and tc.name in ENRICHMENT_FETCH_TOOLS:
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": json.dumps(stored_only_result(tc.name)),
                     })
                     continue
                 try:

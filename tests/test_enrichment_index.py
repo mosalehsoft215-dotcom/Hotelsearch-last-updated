@@ -481,3 +481,46 @@ def test_the_prompt_requires_retrieval_first_and_row_fidelity():
     assert "before every enrichment fetch, without exception" in prompt
     assert "never carry a neighbour's across" in prompt
     assert "name that day as missing" in prompt
+
+
+# ---- matching a question's words to the name the index stored ----
+
+def test_a_partial_name_still_finds_the_record():
+    """Questions rarely repeat a registered name in full. Requiring equality
+    meant every multi-word entity was unreachable unless the question spelled it
+    out — and company and agency names are nearly all multi-word."""
+    from enrichment_index import resolve_entity
+
+    known = {"Hilton Worldwide", "Rihla Travel", "Carawan Al Fahad Hotel", "Makkah"}
+    assert resolve_entity(["Hilton"], known) == "Hilton Worldwide"
+    assert resolve_entity(["Rihla"], known) == "Rihla Travel"
+    assert resolve_entity(["Carawan"], known) == "Carawan Al Fahad Hotel"
+    assert resolve_entity(["Makkah"], known) == "Makkah"
+    # A name given more fully than it was stored resolves too.
+    assert resolve_entity(["Hilton Worldwide Holdings"], known) == "Hilton Worldwide"
+
+
+def test_an_exact_name_wins_over_a_partial_one():
+    from enrichment_index import resolve_entity
+
+    known = {"Hilton", "Hilton Worldwide"}
+    assert resolve_entity(["Hilton"], known) == "Hilton"
+
+
+def test_a_subject_the_index_has_never_seen_still_resolves_to_nothing():
+    """The separation this guard exists for. Loosening the match must not let
+    one city answer for another."""
+    from enrichment_index import resolve_entity
+
+    known = {"Jeddah", "Hilton Worldwide"}
+    assert resolve_entity(["Aswan"], known) is None
+    assert resolve_entity(["Marriott"], known) is None
+    assert resolve_entity([], known) is None
+    assert resolve_entity(["Jeddah"], set()) is None
+
+
+def test_the_answer_does_not_depend_on_set_iteration_order():
+    from enrichment_index import resolve_entity
+
+    known = ["Travel Group A", "Travel Group B"]
+    assert resolve_entity(["Travel"], set(known)) == resolve_entity(["Travel"], set(reversed(known)))

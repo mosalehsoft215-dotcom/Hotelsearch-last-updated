@@ -16,7 +16,8 @@ prompting.
     hasura.py                GraphQL client, response envelope, models, auth token
     hotel_tools.py           hotel tools: search, filters, hotel detail, reprice, reads
     web_enrich.py            web context for a hotel: backends, citations, injection guard
-    web_tools.py             enrich_hotel_info, enrich_destination, search_enrichment
+    web_tools.py             enrich_hotel_info, enrich_destination, enrich_company_facts,
+                             enrich_agency_facts, search_enrichment
     enrichment_index.py      SQLite vector index behind search_enrichment
     ops_tools.py             ops tools: queue summary, failed messages, transactions
     memory.py                durable memory (Layer 2): local graph or Graphiti/FalkorDB
@@ -32,7 +33,7 @@ prompting.
     check_room_options.py    static data + priced options for one hotel, no agent involved
     demo_memory.py           four durable-memory scenes, no infrastructure needed
     scripts/introspect.py    read the live GraphQL schema
-    tests/                   250 hermetic tests + gated live checks
+    tests/                   453 hermetic tests + gated live checks
 
 ## Run
 
@@ -218,21 +219,110 @@ The supplier feed knows stars, amenities and price. It does not know that guests
 complain about the lifts, how far the hotel is from the Haram, that a wing has
 been closed since spring, or what the weather will do during the stay.
 
-Two tools cover that. `enrich_hotel_info` takes one hotel and answers on
+Four tools cover that. `enrich_hotel_info` takes one hotel and answers on
 reputation, location, facilities and risk. `enrich_destination` takes a city and
 dates and answers on weather, travel advice and recent news.
+`enrich_company_facts` takes a chain, brand owner or supplier;
+`enrich_agency_facts` takes a travel agency.
 
 ### Where the answers come from
 
     open-meteo    weather, from a forecast API. No key, and numbers instead of prose.
+    wikidata      company and agency facts, from a structured record rather than
+                  from prose. No key. Every statement carries its own references,
+                  which is what makes "only when verified" a rule and not a hope.
     openrouter    the web plugin on the key already in use, for general lookups.
     playwright    one page, in a real browser, for sites that render nothing
                   without JavaScript. Off unless you install it.
 
 Providers are asked in that order and the first useful answer wins. One that
 fails is recorded and skipped rather than retried. Configure with
-`WEB_SEARCH_BACKEND=openrouter` and `WEB_PLAYWRIGHT_ENABLED=true`; with neither
-set, only the weather provider runs, and the rest say so instead of inventing.
+`WEB_SEARCH_BACKEND=openrouter` and `WEB_PLAYWRIGHT_ENABLED=true`; the two
+keyless providers are on by default, and with nothing else set the remaining
+domains say so instead of inventing.
+
+### Company and agency facts
+
+These two domains carry a fixed set of fields and nothing else:
+
+    company_facts   legal_name, parent_company_or_owner, headquarters, founded,
+                    official_website, ceo
+    agency_facts    legal_or_trading_name, country, headquarters_or_address,
+                    official_website, contact_phone, contact_email,
+                    accreditation_or_licence
+
+A closed schema is what makes "we do not carry that" a true statement rather
+than a shrug. A source offering `annual_revenue` has it dropped and listed under
+`fields_outside_schema`; a field nothing carried is listed under `missing`. Both
+reach the answer as *not verified*, which is the point — the alternative is a
+gap the model fills from its own recollection, indistinguishable from a fact.
+
+Some fields may not be taken on a stranger's say-so. A CEO named by a travel
+blog is a rumour, and a licence number quoted by a directory is worse, because a
+customer could act on it. `ceo`, `contact_phone`, `contact_email` and
+`accreditation_or_licence` are dropped unless the claim carries an authoritative
+source, and named in `not_verified` rather than left silently absent.
+
+Every claim carries an `authority` alongside its status, because counting how
+many pages repeat a value says nothing about who published them:
+
+    government        a state or recognised official authority
+    entity_official   the subject's own website
+    reference_backed  a structured record that cites its own source
+    third_party       everything else, which is most of the web
+
+Confirmed live: Accor's chief executive is a referenced Wikidata statement and is
+reported; Hilton's and Marriott's carry no reference and come back as
+`not_verified`. Hilton's `owned by` is *deprecated* on Wikidata, and reading it
+would have named an owner that stopped being true in 2013 — deprecated
+statements are skipped.
+
+Once an `official_website` is confirmed, the subject's own pages count as
+authoritative for the rest of that record. Finding the site and then not using it
+would leave a fact quoted from the company's own leadership page ranking level
+with a directory.
+
+### An official advisory has to come from a government
+
+An answer may call something an official government travel advisory only when a
+government or recognised official authority published it. News sites, blogs,
+aggregators and travel sites never satisfy that, however accurately they quote
+it — the result reports `checks.official_advisory_verified`, and when it is
+false the note says no official advisory was verified.
+
+The host is read structurally: the last labels of the domain, against a list of
+the suffixes states actually publish under. Searching for `gov` anywhere in the
+string — which is how the tier ranking used to work — calls
+`gov.uk.travel-deals.com` a government. That is a fine way to rank a page and a
+bad way to decide whether a warning is official.
+
+`verify()` enforces the same rule on the wording. An answer that calls a Reuters
+report an official advisory fails; the same sentence passes when a `gov.uk`
+source is behind it, whether it arrived from a fresh fetch or out of the index.
+Naming the body is not the trigger — "Reuters reports that the Foreign Office
+advises against travel" is the correctly attributed form, and an earlier version
+of the check wrongly failed it.
+
+### When the user says not to fetch
+
+"using stored enrichment only", "do not fetch", "do not use fresh data", "use
+existing enrichment only" — on a turn phrased that way, `search_enrichment` still
+runs, because it only reads what an earlier fetch already stored. All four fetch
+tools are refused *before* they run and are never recorded as tool calls, so the
+restriction is a property of what the run actually did. The model is handed back
+the reason and told which tool is still open, so the turn continues from the
+index instead of stalling. If the entity, the date or the field is not there, the
+answer says it is unavailable in stored enrichment and stops.
+
+The flag is re-read every turn — a chat session reuses one context, so "do not
+fetch" on turn 3 must not still be blocking on turn 4. A delegated child is the
+exception: it keeps what its parent was told, since handing work on is not a way
+round a restriction. `dispatch()` refuses as well, for anything reaching it
+another way.
+
+Detection is deliberately tight. It gates a hard refusal, so it holds only
+phrasings that can mean one thing; "what does the cached data say" reads as a
+question about the cache as easily as an instruction, and is left to the prompt.
 
 A claim is kept only if its url appears in the search results the provider
 returned. If nothing came back to check against, the claim is dropped — a url the
@@ -401,7 +491,7 @@ report the parent as changed with no isolation failure behind it.
 
 ## Tests
 
-    pytest -q                                   250 tests, no network, no side files
+    pytest -q                                   453 tests, no network, no side files
     docker compose exec app pytest -q           the same suite inside the image
 
 The suite is hermetic: `tests/conftest.py` swaps the enrichment index and its
@@ -413,6 +503,16 @@ stubbed — the group-id charset, the empty-query listing and the per-group grap
 which is where every production bug on that path came from.
 `tests/test_web_enrich.py` covers provider fallback, corroboration, disagreement,
 injected instructions and the money guard.
+`tests/test_enrichment_domains.py` covers the two fact domains, the verified-only
+fields, the closed schema, freshness, and which hosts count as a government —
+including the ones that only look official.
+`tests/test_verify_grounding.py` covers what the *answer* may say: the official
+advisory label, and fields the fetch reported it could not confirm.
+`tests/test_stored_only_routing.py` drives the real agent loop and asserts that
+no fetch tool runs on a no-fetch turn.
+`tests/test_delegation_isolation.py` is adversarial: every secret is a canary
+string, the child is asked outright to reveal the parent, and the assertions read
+what was actually sent to the child's model rather than what its context holds.
 
 Live checks are gated one by one:
 

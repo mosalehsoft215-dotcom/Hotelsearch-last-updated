@@ -6,7 +6,8 @@ from typing import Any
 from config import get_settings
 from enrichment_index import MIN_SCORE, EnrichmentIndex, mentioned_entities
 from web_enrich import (
-    DESTINATION_DOMAINS, DOMAINS, HOTEL_DOMAINS, Cache, Enricher, build_providers,
+    AGENCY_DOMAINS, COMPANY_DOMAINS, DESTINATION_DOMAINS, DOMAINS, ENTITY_TYPES,
+    HOTEL_DOMAINS, Cache, Enricher, build_providers,
 )
 
 _settings = get_settings()
@@ -57,6 +58,47 @@ async def enrich_destination(city: str, checkIn: str | None = None,
     }
 
 
+async def enrich_company_facts(companyName: str, officialSite: str | None = None,
+                               wikidataId: str | None = None) -> dict[str, Any]:
+    """Registration facts about a hotel chain, brand owner or supplier: legal
+    name, parent or owner, headquarters, founding year, official website, and
+    the chief executive when a source stands behind it. A fixed set of fields —
+    anything outside it comes back as not carried, rather than as an answer."""
+    context: dict[str, Any] = {"official_domains": [officialSite] if officialSite else []}
+    if wikidataId:
+        context["wikidata_id"] = wikidataId
+    return {
+        "company": companyName,
+        "domains": {d: (await _enricher.enrich(companyName, d, context,
+                                               entity_type="company",
+                                               entity_ref=companyName)).to_model()
+                    for d in COMPANY_DOMAINS},
+    }
+
+
+async def enrich_agency_facts(agencyName: str, country: str | None = None,
+                              officialSite: str | None = None,
+                              wikidataId: str | None = None) -> dict[str, Any]:
+    """Who a travel agency actually is: registered or trading name, country,
+    head office, official website, published contact details, and an
+    accreditation or licence number when one can be confirmed. Contact details
+    and licence numbers are only reported from the agency's own site or a
+    regulator — a number copied off a directory is not a verified number."""
+    subject = f"{agencyName}, {country}" if country else agencyName
+    context: dict[str, Any] = {"official_domains": [officialSite] if officialSite else [],
+                               "country": country}
+    if wikidataId:
+        context["wikidata_id"] = wikidataId
+    return {
+        "agency": agencyName,
+        "country": country,
+        "domains": {d: (await _enricher.enrich(subject, d, context,
+                                               entity_type="agency",
+                                               entity_ref=agencyName)).to_model()
+                    for d in AGENCY_DOMAINS},
+    }
+
+
 def _note(question: str, matches: list[dict[str, Any]],
           stale: list[dict[str, Any]] | None = None,
           available: int = 0, returned: int = 0) -> str | None:
@@ -73,12 +115,13 @@ def _note(question: str, matches: list[dict[str, Any]],
     if stale:
         subject = stale[0].get("entity_ref") or stale[0].get("subject") or "this subject"
         return (f"everything held for {subject} in this domain has passed its "
-                "freshness window. Fetch it again with enrich_destination or "
-                "enrich_hotel_info rather than answering from it.")
+                "freshness window. Fetch it again with the enrichment tool for "
+                "that subject rather than answering from it.")
     named = mentioned_entities(question)
     if named:
-        return (f"nothing enriched so far covers {named[0]}. "
-                "Fetch it first with enrich_destination or enrich_hotel_info.")
+        return (f"nothing enriched so far covers {named[0]}. Fetch it first with "
+                "enrich_destination, enrich_hotel_info, enrich_company_facts or "
+                "enrich_agency_facts.")
     return "nothing enriched so far answers this"
 
 
@@ -88,12 +131,13 @@ async def search_enrichment(question: str, limit: int = 12, subject: str | None 
                             minScore: float | None = None,
                             includeStale: bool = False) -> dict[str, Any]:
     """Ask in plain words across everything enrichment has already fetched, with no
-    need to know the entity or the domain first. Narrow with entityType ("hotel"
-    or "city"), entityRef, or domain when you do know them."""
+    need to know the entity or the domain first. Narrow with entityType ("hotel",
+    "city", "company" or "agency"), entityRef, or domain when you do know them."""
     if domain and domain not in DOMAINS:
         raise ValueError(f"unknown domain {domain!r}; expected one of {', '.join(DOMAINS)}")
-    if entityType and entityType not in ("hotel", "city"):
-        raise ValueError(f"unknown entityType {entityType!r}; expected 'hotel' or 'city'")
+    if entityType and entityType not in ENTITY_TYPES:
+        raise ValueError(f"unknown entityType {entityType!r}; "
+                         f"expected one of {', '.join(ENTITY_TYPES)}")
     floor = MIN_SCORE if minScore is None else minScore
     matches = _index.search(question, limit=limit, subject=subject, domain=domain,
                             entity_type=entityType, entity_ref=entityRef,

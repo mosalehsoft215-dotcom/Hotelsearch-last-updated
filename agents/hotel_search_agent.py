@@ -9,9 +9,10 @@ import re
 from datetime import date
 
 from config import get_settings
-from web_enrich import MONEY
+from web_enrich import MONEY, is_government_source
 from runtime import (
-    AgentBase, AgentContext, AgentRunResult, ToolCall, VerificationResult, build_llm,
+    ENRICHMENT_FETCH_TOOLS, AgentBase, AgentContext, AgentRunResult, ToolCall,
+    VerificationResult, build_llm,
 )
 
 ROLE = "hotel_search_agent"
@@ -21,6 +22,7 @@ ALLOWED_TOOLS = frozenset({
     "get_hotel_static_data", "get_hotel_availability_options", "get_hotel_options",
     "refresh_hotel_price", "remember_preference", "recall_preferences",
     "enrich_hotel_info", "enrich_destination", "search_enrichment",
+    "enrich_company_facts", "enrich_agency_facts",
     "list_hotel_bookings", "get_hotel_booking", "poll_hotel_booking",
 })
 MEM_SESSION_ID = "hotel_search_session_id"
@@ -33,7 +35,8 @@ MEM_ANSWER = "last_answer"
 # say "check-in is typically 15:00"; an enrichment answer that says "typical
 # September patterns" is filling a gap the fetch left open.
 _ENRICHMENT_TOOLS = frozenset({"enrich_hotel_info", "enrich_destination",
-                               "search_enrichment"})
+                               "search_enrichment", "enrich_company_facts",
+                               "enrich_agency_facts"})
 
 # Hedges that introduce a number nothing returned. Seen live: a stay of 1-4
 # September against a forecast covering 10-13, answered with "based on typical
@@ -264,6 +267,105 @@ def _misaligned_days(answer: str, calls: list[ToolCall]) -> list[str]:
     return wrong
 
 
+# Calling something an official advisory is a claim about who published it, not
+# about how it reads. A news site quoting the Foreign Office accurately is still
+# not the Foreign Office.
+_OFFICIAL_ADVISORY = re.compile(
+    r"\bofficial\s+(?:\w+\s+){0,3}?advisor(?:y|ies)\b"
+    r"|\bofficial\s+(?:\w+\s+){0,3}?(?:travel\s+)?(?:advice|guidance|warning)\b"
+    r"|\bgovernment(?:'s|al)?\s+(?:\w+\s+){0,3}?(?:advisor(?:y|ies)|advice|warning)\b",
+    re.I)
+# Naming the body is deliberately not on that list. "Reuters reports that the
+# Foreign Office advises against travel" is the correctly attributed form — it
+# says who published what — and an earlier version of this pattern failed it for
+# containing the words "Foreign Office advises". What is gated is the label an
+# answer puts on a claim, not the mention of a government.
+
+
+def _claims_official_advisory(answer: str) -> bool:
+    """True only where the answer asserts an official advisory, not where it
+    reports that none was found. Same trap as the confirmed-price check: "no
+    official advisory was verified" contains "official advisory"."""
+    for match in _OFFICIAL_ADVISORY.finditer(answer):
+        before = answer[:match.start()]
+        sentence = re.split(r"(?<=[.!?])\s+", before)[-1] if before else ""
+        if _NEGATED.search(sentence):
+            continue
+        return True
+    return False
+
+
+def _official_advisory_returned(calls: list[ToolCall]) -> bool:
+    """Whether any tool actually handed back an advisory a government published.
+    Both shapes count: a fresh fetch, which reports it in `checks`, and a stored
+    claim, whose sources are checked the same way they were on the way in."""
+    for call in calls:
+        result = call.result
+        if not isinstance(result, dict):
+            continue
+        for name, payload in (result.get("domains") or {}).items():
+            if name == "advisory" and isinstance(payload, dict) and (
+                    payload.get("checks") or {}).get("official_advisory_verified"):
+                return True
+        for match in result.get("matches") or []:
+            if not isinstance(match, dict) or match.get("domain") != "advisory":
+                continue
+            if any(is_government_source((s or {}).get("url", ""))
+                   for s in (match.get("sources") or []) if isinstance(s, dict)):
+                return True
+    return False
+
+
+# How a field that was not confirmed would show up in an answer anyway. Only the
+# fields with a surface form specific enough to recognise are listed: a name
+# after "the CEO is", a year after "founded", an email, a licence number. The
+# rest are left to the prompt, because a check that guesses is worse than none.
+_FIELD_ASSERTED = {
+    # The label is case-insensitive, the name deliberately is not — re.I on the
+    # whole pattern would let "the chief executive is not published" match as a
+    # name. Scoped inline flags would say this better but need 3.11, and this
+    # runs on 3.10.
+    "ceo": re.compile(r"\b(?:CEO|[Cc]eo|[Cc]hief\s+[Ee]xecutive(?:\s+[Oo]fficer)?)\b"
+                      r"[^.\n]{0,24}?\b(?:is|are|:|named|remains)\s+"
+                      r"[A-Z][\w.'-]+\s+[A-Z][\w.'-]+"),
+    "founded": re.compile(r"\b(?:founded|established|incorporated|dates?\s+back)\b"
+                          r"[^.\n]{0,20}?\b(?:1[5-9]\d{2}|20\d{2})\b", re.I),
+    "contact_email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.]{2,}"),
+    "contact_phone": re.compile(r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?){2,4}\d{2,4}"),
+    "accreditation_or_licence": re.compile(
+        r"\b(?:IATA|ATOL|licen[cs]e|accredit\w*|registration)\b[^.\n]{0,24}?"
+        r"\b[A-Z0-9][A-Z0-9-]{3,}\b"),
+    "official_website": re.compile(r"\bhttps?://|\bwww\.[\w-]+\.\w{2,}"),
+}
+
+_FACT_DOMAINS = ("company_facts", "agency_facts")
+
+
+def _unconfirmed_fields(calls: list[ToolCall]) -> set[str]:
+    """Fields a company or agency fetch came back without. `not_verified` is the
+    one nobody could source; `missing` is the one nothing carried at all. Either
+    way the answer may not supply it."""
+    unconfirmed: set[str] = set()
+    for call in calls:
+        result = call.result
+        if not isinstance(result, dict):
+            continue
+        for name, payload in (result.get("domains") or {}).items():
+            if name not in _FACT_DOMAINS or not isinstance(payload, dict):
+                continue
+            checks = payload.get("checks") or {}
+            unconfirmed |= set(checks.get("not_verified") or [])
+            unconfirmed |= set(checks.get("missing") or [])
+            unconfirmed -= set(checks.get("fields_present") or [])
+    return unconfirmed
+
+
+def _asserted_without_source(answer: str, calls: list[ToolCall]) -> list[str]:
+    """The fields the answer fills in that the fetch reported it could not."""
+    return sorted(name for name in _unconfirmed_fields(calls)
+                  if (pattern := _FIELD_ASSERTED.get(name)) and pattern.search(answer))
+
+
 def _mentions_money(result: object) -> bool:
     """A web claim that quotes a price is out of scope — the supplier owns those."""
     if not isinstance(result, dict):
@@ -317,7 +419,13 @@ Without a transactionId, do not attempt a lock and do not describe one as pendin
 Once a room's price is confirmed, keep in memory: {MEM_SESSION_ID} (the search uuid), {MEM_OPTION_REF} (the OptionRefId), {MEM_CONFIRMED_PRICE} (the confirmed price), and {MEM_PARAMS} (city, dates, guests).
 
 If nothing is available, say so plainly and suggest different dates or a nearby area. Never invent hotels or prices.{known}
-For anything the supplier feed does not answer, use the enrichment tools. enrich_hotel_info covers one hotel — reputation, location, facilities, and risks such as renovation or closure. enrich_destination covers the trip itself — weather for the dates, current travel advice, recent news.
+For anything the supplier feed does not answer, use the enrichment tools. enrich_hotel_info covers one hotel — reputation, location, facilities, and risks such as renovation or closure. enrich_destination covers the trip itself — weather for the dates, current travel advice, recent news. enrich_company_facts covers a chain, brand owner or supplier — legal name, parent or owner, headquarters, year founded, official website, chief executive. enrich_agency_facts covers a travel agency — registered or trading name, country, head office, official website, published contact details, accreditation or licence.
+
+Those last two carry a fixed set of fields and nothing else. Each result lists what it found and, separately, what it could not: `not_verified` is a field no authoritative source stood behind, `missing` is one nothing carried. Report both as not verified. Do not fill either from your own knowledge — a chief executive, a licence number or a phone number that no source returned is a guess, and here it is a guess a customer might act on. If the user asks for a field outside the list, say it is not something enrichment carries.
+
+Only call something an official government travel advisory when the source behind it is a government or a recognised official authority. The advisory result says so directly in `checks.official_advisory_verified`. A news site, a blog, an aggregator or a travel site reporting an advisory is not the advisory, however accurate it is: attribute what it says to the site that published it, and say plainly that no official advisory was verified. Never upgrade a report about an advisory into the advisory itself.
+
+When the user says to use stored enrichment only, not to fetch, or not to use fresh data, then search_enrichment is the only enrichment tool you may call — the fetch tools are refused for that turn and will tell you so. Answer from what it returns. If the entity, the date or the field they asked about is not in it, say it is not available in stored enrichment and stop there. Do not answer it from your own knowledge, and do not try another fetch tool to get round it.
 
 Call search_enrichment before every enrichment fetch, without exception — the first question about a city as much as the fifth. It reads what was already fetched, costs nothing, and often holds the answer. Fetch only after it comes back with nothing useful, and say which of the two you used.
 
@@ -421,6 +529,39 @@ Apply what is already known above without being asked again, and say which prefe
                     + ". A forecast is a series: state each day from its own "
                       "record, and say a day is missing rather than filling it "
                       "from the one beside it")
+
+            # Naming the publisher is the whole content of the phrase "official
+            # travel advisory". A news site reporting one accurately is still
+            # not the source, so this asks who the claim came from rather than
+            # whether an advisory was discussed.
+            if _claims_official_advisory(answer) and not _official_advisory_returned(
+                    enrichment_calls):
+                result.add_issue(
+                    "answer calls this an official government travel advisory, but no "
+                    "source behind it is a government or recognised official authority. "
+                    "Say no official advisory was verified, and attribute what you do "
+                    "have to the site that published it")
+
+            # The other half of the same rule: a field the fetch reported it
+            # could not confirm must not reappear in the answer with a value.
+            # A CEO nobody sourced is the model's own recollection wearing the
+            # tool's credibility.
+            supplied = _asserted_without_source(answer, enrichment_calls)
+            if supplied:
+                result.add_issue(
+                    "answer supplies " + ", ".join(supplied)
+                    + ", which enrichment reported as not verified or not found. "
+                      "Report those fields as not verified rather than from memory")
+
+        # The user ruled out going back to the web for this turn. The run loop
+        # refuses the call before it happens, so a fetch appearing here means
+        # something got past it.
+        if ctx.stored_only:
+            fetched = sorted({c.name for c in ctx.tool_calls} & ENRICHMENT_FETCH_TOOLS)
+            if fetched:
+                result.add_issue(
+                    "this request was restricted to stored enrichment, but "
+                    + ", ".join(fetched) + " went out to fetch")
 
         if _OPTION_REF.search(answer):
             result.add_issue("answer contains a supplier option reference; it is "

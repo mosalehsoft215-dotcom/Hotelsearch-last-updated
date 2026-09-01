@@ -100,7 +100,9 @@ def test_no_gemini_provider_remains():
     import web_enrich
     assert not hasattr(web_enrich, "GeminiGrounded")
     settings = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None)
-    assert [p.name for p in web_enrich.build_providers(settings)] == ["open-meteo"]
+    # The keyless pair: a forecast API and a facts database, both on by default
+    # because neither needs an account.
+    assert [p.name for p in web_enrich.build_providers(settings)] == ["open-meteo", "wikidata"]
 
 
 # ---- three models, three keys ----
