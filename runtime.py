@@ -519,6 +519,7 @@ TOOL_SPECS.extend([
             "checkOut": {"type": "string", "description": "YYYY-MM-DD"},
             "domains": {"type": "array", "items": {"type": "string",
                         "enum": ["weather", "advisory", "news"]}},
+            "countrySlug": {"type": "string", "description": "Only if an advisory lookup came back saying the country is spelled differently, e.g. 'usa' for the United States. The country is resolved from the city otherwise."},
         }, "required": ["city"]}}},
     {"type": "function", "function": {
         "name": "search_enrichment",
@@ -627,7 +628,11 @@ ENRICHMENT_FETCH_TOOLS = frozenset({
 # is left to the prompt — this list gates a hard refusal, so it holds only
 # phrasings that can mean one thing.
 _STORED_ONLY = re.compile(
-    r"\bus(?:e|ing)\s+(?:only\s+)?(?:the\s+)?(?:stored|existing|cached|indexed|already[- ]"
+    # `only` is required, not optional. Written with it optional, this branch
+    # matched the bare phrase "Use stored enrichment" — so "Use stored
+    # enrichment first, then fetch if missing", which is a fetch-permitting
+    # instruction, was read as a refusal and blocked the fetch it asked for.
+    r"\bus(?:e|ing)\s+only\s+(?:the\s+)?(?:stored|existing|cached|indexed|already[- ]"
     r"(?:fetched|stored))\s+(?:enrichment|data|information|claims|facts)\b"
     r"|\b(?:stored|existing|cached|indexed)\s+(?:enrichment|data)\s+only\b"
     r"|\bdo\s*n[o']?t\s+(?:fetch|re-?fetch|refresh|look\s+it\s+up|go\s+online|"
@@ -638,9 +643,32 @@ _STORED_ONLY = re.compile(
     re.I)
 
 
+# An explicit permission to fetch when the index comes up short. Checked
+# first: "use stored enrichment first, then fetch if missing" names a
+# restriction and then lifts it, and the lifting is the operative half. Reading
+# only the first clause turns a two-step instruction into a refusal.
+_FETCH_PERMITTED = re.compile(
+    r"\bthen\s+(?:you\s+(?:may|can)\s+|go\s+(?:ahead\s+and\s+)?)?(?:re-?)?fetch\b"
+    r"|\b(?:re-?)?fetch\s+(?:it|them|those|any|the\s+rest)?\s*(?:only\s+)?if\s+"
+    r"(?:it\s+is\s+|they\s+are\s+|anything\s+is\s+)?(?:missing|absent|unavailable|"
+    r"stale|expired|empty|needed|required|not\s+(?:there|stored|found|available|present))\b"
+    r"|\b(?:otherwise|failing\s+that|if\s+not|if\s+nothing)\b[^.\n]{0,40}?\b(?:re-?)?fetch\b"
+    r"|\byou\s+m(?:ay|ust)\s+(?:then\s+)?(?:re-?)?fetch\b"
+    r"|\b(?:re-?)?fetch(?:ing)?\s+is\s+(?:allowed|permitted|fine|ok(?:ay)?)\b"
+    r"|\bfall\s*back\s+to\s+(?:a\s+)?(?:re-?)?fetch\b", re.I)
+
+
 def is_stored_only(message: str) -> bool:
-    """Whether the user ruled out going back to the web for this turn."""
-    return bool(_STORED_ONLY.search(message or ""))
+    """Whether the user ruled out going back to the web for this turn.
+
+    A restriction phrase alone is not enough, because the same sentence often
+    grants the fallback: "use stored enrichment first, then fetch if missing"
+    is an ordering, not a prohibition. Permission is read first and wins.
+    """
+    text = message or ""
+    if _FETCH_PERMITTED.search(text):
+        return False
+    return bool(_STORED_ONLY.search(text))
 
 
 class StoredOnlyRefusal(RuntimeError):

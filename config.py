@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # by default — without it those two domains have no provider at all unless
     # WEB_SEARCH_BACKEND is set.
     web_wikidata_enabled: bool = Field(default=True, alias="WEB_WIKIDATA_ENABLED")
+    # Travel advice from the government that issues it. Keyless, and on by
+    # default because without it the advisory domain has no provider at all
+    # and every answer reads "no official advisory verified".
+    web_govuk_advisory_enabled: bool = Field(default=True, alias="WEB_GOVUK_ADVISORY_ENABLED")
     web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
     web_search_cache_seconds: int = Field(default=3600, alias="WEB_SEARCH_CACHE_SECONDS")
 

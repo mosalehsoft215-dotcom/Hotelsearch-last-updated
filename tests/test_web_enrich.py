@@ -241,12 +241,18 @@ async def test_a_domain_with_no_provider_says_so():
 def test_only_configured_providers_are_built():
     from config import Settings
     bare = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None)
-    assert [p.name for p in build_providers(bare)] == ["open-meteo", "wikidata"]
+    # The three keyless ones, on by default: a domain with no provider does not
+    # return "nothing found", it returns nothing at all — and that reads as an
+    # answer. Weather, company/agency facts and advisories each have one.
+    assert [p.name for p in build_providers(bare)] == [
+        "open-meteo", "wikidata", "gov-uk-advisory"]
     full = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
                     WEB_SEARCH_BACKEND="openrouter", OPENROUTER_API_KEY="o")
-    assert [p.name for p in build_providers(full)] == ["open-meteo", "wikidata", "openrouter"]
+    assert [p.name for p in build_providers(full)] == [
+        "open-meteo", "wikidata", "gov-uk-advisory", "openrouter"]
     off = Settings(_env_file=None, YARVEL_SECRET=None, YARVEL_ORG_ID=None,
-                   WEB_OPENMETEO_ENABLED=False, WEB_WIKIDATA_ENABLED=False)
+                   WEB_OPENMETEO_ENABLED=False, WEB_WIKIDATA_ENABLED=False,
+                   WEB_GOVUK_ADVISORY_ENABLED=False)
     assert [p.name for p in build_providers(off)] == []
 
 

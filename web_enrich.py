@@ -26,7 +26,9 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+import unicodedata
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlparse
 
@@ -695,6 +697,148 @@ class OpenMeteo:
         return claims
 
 
+class GovUkAdvisory:
+    """The travel advice for a destination, from a government that issues it.
+
+    Until now the advisory domain had no provider unless `WEB_SEARCH_BACKEND`
+    was set, which it is not by default. `enrich_destination` therefore returned
+    "no provider configured for advisory" and the answer came out as "no
+    official advisory verified" — a different statement, and the wrong one:
+    nothing had been looked for. The gate was working; there was nothing to gate.
+
+    Same argument as open-meteo for weather. Go to the body that publishes the
+    thing rather than to a page about it. GOV.UK's Content API is free, needs no
+    key, and is a government publishing its own advice, so the safety gate is
+    satisfied on the host — `is_government_source("www.gov.uk")` — by fact
+    rather than by an exception carved out for it. Nothing about the gate
+    changes.
+
+    Advisories are per country; `enrich_destination` is handed a city. The
+    country comes from the same open-meteo geocoding the forecast already uses.
+    Confirmed live: Muscat -> Oman -> /foreign-travel-advice/oman, alert_status
+    [] and five narrative sections, last updated 2026-07-22.
+    """
+    name = "gov-uk-advisory"
+    GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+    CONTENT = "https://www.gov.uk/api/content/foreign-travel-advice/{slug}"
+    PAGE = "https://www.gov.uk/foreign-travel-advice/{slug}"
+    _UA = ("hotels-mcp-enrichment/1.0 "
+           "(https://github.com/mosalehsoft215-dotcom/Hotelsearch-last-updated) httpx")
+
+    # Highest severity first. `alert_status` can carry several entries at once,
+    # for different regions of one country; this picks the headline and the rest
+    # stay in `regions_flagged`. Vocabulary is GOV.UK's own.
+    _SEVERITY = ("avoid_all_travel_to_country", "avoid_all_travel_to_parts",
+                 "avoid_all_but_essential_travel_to_country",
+                 "avoid_all_but_essential_travel_to_parts",
+                 "avoid_all_but_essential_travel_to_temp")
+
+    # Where GOV.UK's slug is not the country's name. Each one checked live
+    # rather than guessed: the left side 404s and the right side answers.
+    _SLUG_ALIASES = {"united-states": "usa", "united-states-of-america": "usa",
+                     "ivory-coast": "cote-d-ivoire", "east-timor": "timor-leste",
+                     "macau": "macao", "vatican-city": "vatican-city-holy-see"}
+
+    # The section that carries the safety advice itself. `change_description` is
+    # only GOV.UK's changelog blurb — "updated information about..." — which
+    # says what moved, not what the advice is.
+    _ADVICE_PART = "warnings-and-insurance"
+
+    def __init__(self, timeout: float = 20.0, transport: Any = None) -> None:
+        import httpx
+        self._client = httpx.AsyncClient(timeout=timeout, transport=transport,
+                                         headers={"User-Agent": self._UA},
+                                         follow_redirects=True)
+
+    def handles(self, domain: str) -> bool:
+        return domain == "advisory"
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    @staticmethod
+    def slugify(name: str) -> str:
+        """A country name as GOV.UK spells it in a url. Accents are stripped
+        first, since geocoding answers with "Côte d'Ivoire"."""
+        plain = unicodedata.normalize("NFKD", name or "")
+        plain = "".join(c for c in plain if not unicodedata.combining(c))
+        slug = re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
+        return GovUkAdvisory._SLUG_ALIASES.get(slug, slug)
+
+    async def _country_slug(self, subject: str, context: dict[str, Any]) -> str | None:
+        if context.get("country_slug"):
+            return self.slugify(str(context["country_slug"]))
+        if context.get("country"):
+            return self.slugify(str(context["country"]))
+        place = await self._client.get(self.GEOCODE, params={"name": subject, "count": 1,
+                                                            "format": "json"})
+        if place.status_code >= 400:
+            raise ProviderUnavailable(f"geocoding HTTP {place.status_code}")
+        results = (place.json() or {}).get("results") or []
+        country = (results[0].get("country") if results else None)
+        return self.slugify(country) if country else None
+
+    @staticmethod
+    def _plain_text(html: str) -> str:
+        """Readable text out of GOV.UK's block markup, without a new dependency.
+        Block ends become line breaks so sentences do not run together, then
+        tags go and entities are decoded."""
+        text = re.sub(r"(?i)</(?:p|h[1-6]|li|div|tr)>", "\n", html or "")
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", text)
+        return unescape(re.sub(r"<[^>]+>", " ", text))
+
+    def _level(self, alert_status: list[str]) -> str:
+        if not alert_status:
+            return "none"
+        for level in self._SEVERITY:
+            if level in alert_status:
+                return level
+        return alert_status[0]        # unrecognised — surface it, do not hide it
+
+    async def fetch(self, subject: str, domain: str, context: dict[str, Any]) -> list[Claim]:
+        slug = await self._country_slug(subject, context)
+        if not slug:
+            raise ProviderUnavailable(f"no country resolved for {subject!r}")
+        response = await self._client.get(self.CONTENT.format(slug=slug))
+        if response.status_code == 404:
+            # Named rather than swallowed: the caller can pass countrySlug to
+            # correct it, and "no page for this slug" is not "no advisory".
+            raise ProviderUnavailable(
+                f"gov.uk has no travel advice at /foreign-travel-advice/{slug}; "
+                f"pass countrySlug if the country is spelled differently there")
+        if response.status_code >= 400:
+            raise ProviderUnavailable(f"gov.uk HTTP {response.status_code}")
+        try:
+            payload = response.json() or {}
+        except ValueError as exc:
+            raise ProviderUnavailable(f"gov.uk: {exc}") from exc
+
+        details = payload.get("details") or {}
+        alert_status = [str(a) for a in (details.get("alert_status") or [])]
+        page = self.PAGE.format(slug=slug)
+        source = Source(url=page, title=payload.get("title") or f"{slug} travel advice",
+                        tier="gov")
+
+        claims = [Claim(domain=domain, field_name="advisory_level", provider=self.name,
+                        value=self._level(alert_status), sources=[source])]
+        updated = str(payload.get("public_updated_at") or "")[:10]
+        if updated:
+            claims.append(Claim(domain=domain, field_name="advisory_updated",
+                                provider=self.name, value=updated, sources=[source]))
+        if len(alert_status) > 1:
+            claims.append(Claim(domain=domain, field_name="regions_flagged",
+                                provider=self.name, value=", ".join(alert_status),
+                                sources=[source]))
+        advice = next((p for p in (details.get("parts") or [])
+                       if p.get("slug") == self._ADVICE_PART), None)
+        body = neutralise(self._plain_text((advice or {}).get("body", "")), limit=600)
+        if body:
+            claims.append(Claim(domain=domain, field_name="guidance", provider=self.name,
+                                value=body, sources=[source]))
+        return claims
+
+
 class WikidataFacts:
     """Company and agency registration facts, from a structured record.
 
@@ -941,9 +1085,21 @@ class Enricher:
         context = context or {}
         usable = [p for p in self.providers if p.handles(domain)]
         if not usable:
+            # Say which of the two this is. With no advisory provider configured
+            # this returned a bare "no provider configured", the agent wrote "no
+            # official advisory verified", and those are different claims: one
+            # means nobody looked, the other means someone looked and found no
+            # government behind it. `official_advisory_verified` is deliberately
+            # left unset rather than set false — the gate reads absent as
+            # not-verified either way, so nothing is loosened by not asserting a
+            # search that never happened.
             return Enrichment(subject=subject, domain=domain, entity_type=entity_type,
                               entity_ref=entity_ref or subject,
-                              note=f"no provider configured for {domain}")
+                              checks={"provider_configured": False},
+                              note=(f"no provider configured for {domain}: nothing was "
+                                    "searched, which is not the same as nothing being "
+                                    "found. Say the lookup was unavailable, not that the "
+                                    "subject has none."))
 
         key = Cache.key(subject, domain, [p.name for p in usable], context)
         if use_cache:
@@ -1000,6 +1156,8 @@ def build_providers(settings: Any) -> list[Provider]:
         providers.append(OpenMeteo())
     if getattr(settings, "web_wikidata_enabled", True):
         providers.append(WikidataFacts())
+    if getattr(settings, "web_govuk_advisory_enabled", True):
+        providers.append(GovUkAdvisory())
     if (getattr(settings, "web_search_backend", "none") == "openrouter"
             and settings.openrouter_api_key):
         providers.append(OpenRouterWeb(api_key=settings.openrouter_api_key,

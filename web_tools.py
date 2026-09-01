@@ -43,11 +43,16 @@ async def enrich_hotel_info(hotelName: str, city: str | None = None,
 
 async def enrich_destination(city: str, checkIn: str | None = None,
                              checkOut: str | None = None,
-                             domains: list[str] | None = None) -> dict[str, Any]:
+                             domains: list[str] | None = None,
+                             countrySlug: str | None = None) -> dict[str, Any]:
     """Conditions at the destination for the stay: weather for the dates, the
-    current travel advice, and recent news worth knowing."""
+    current travel advice, and recent news worth knowing.
+
+    Advisories are issued per country, so the country is resolved from the city
+    automatically. `countrySlug` overrides that for the handful of countries the
+    issuing government spells differently in a url."""
     wanted = [d for d in (domains or list(DESTINATION_DOMAINS)) if d in DESTINATION_DOMAINS]
-    context = {"check_in": checkIn, "check_out": checkOut}
+    context = {"check_in": checkIn, "check_out": checkOut, "country_slug": countrySlug}
     return {
         "city": city,
         "checkIn": checkIn,

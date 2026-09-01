@@ -33,7 +33,7 @@ prompting.
     check_room_options.py    static data + priced options for one hotel, no agent involved
     demo_memory.py           four durable-memory scenes, no infrastructure needed
     scripts/introspect.py    read the live GraphQL schema
-    tests/                   453 hermetic tests + gated live checks
+    tests/                   496 hermetic tests + gated live checks
 
 ## Run
 
@@ -231,6 +231,9 @@ dates and answers on weather, travel advice and recent news.
     wikidata      company and agency facts, from a structured record rather than
                   from prose. No key. Every statement carries its own references,
                   which is what makes "only when verified" a rule and not a hope.
+    gov-uk        travel advisories, from the government that issues them. No key.
+                  Recognised by the safety gate on its host, like any other
+                  government, rather than by an exception carved out for it.
     openrouter    the web plugin on the key already in use, for general lookups.
     playwright    one page, in a real browser, for sites that render nothing
                   without JavaScript. Off unless you install it.
@@ -296,6 +299,25 @@ string — which is how the tier ranking used to work — calls
 `gov.uk.travel-deals.com` a government. That is a fine way to rank a page and a
 bad way to decide whether a warning is official.
 
+A gate needs something to gate. Until `gov-uk-advisory` existed, the advisory
+domain had no provider at all unless `WEB_SEARCH_BACKEND` was set — which it is
+not by default — so `enrich_destination` returned "no provider configured" and
+every answer came out as "no official advisory verified". That was true only in
+the sense that nobody had looked. Those two situations now read differently: a
+domain with no provider reports `provider_configured: false` and says nothing
+was searched, and deliberately does not set `official_advisory_verified` at all,
+since asserting `false` would claim a search that never happened. The gate reads
+absent as not-verified either way, so nothing is loosened by not asserting it.
+
+Advisories are per country and `enrich_destination` is handed a city, so the
+country comes from the same open-meteo geocoding the forecast already uses —
+Muscat resolves to Oman, then to `/foreign-travel-advice/oman`. The handful of
+countries GOV.UK spells differently are mapped from checked responses rather
+than guessed (`United States` → `usa`, `Ivory Coast` → `cote-d-ivoire`), accents
+are stripped first because geocoding answers "Côte d'Ivoire", and an unmapped
+404 names the slug it tried so `countrySlug` can correct it instead of the
+answer concluding the country has no advisory.
+
 `verify()` enforces the same rule on the wording. An answer that calls a Reuters
 report an official advisory fails; the same sentence passes when a `gov.uk`
 source is behind it, whether it arrived from a fresh fetch or out of the index.
@@ -323,6 +345,15 @@ another way.
 Detection is deliberately tight. It gates a hard refusal, so it holds only
 phrasings that can mean one thing; "what does the cached data say" reads as a
 question about the cache as easily as an instruction, and is left to the prompt.
+
+Tight in both directions. The exclusivity word is required, and an explicit
+permission to fetch is read first and wins, because a sentence often names the
+restriction and then lifts it: "use stored enrichment first, then fetch if
+missing" is an ordering, not a prohibition. Written with `only` optional, the
+detector matched the bare phrase "use stored enrichment" and never reached the
+clause that lifted it, so the fetch the user had asked for was refused. What
+must not follow from that is a detector unable to refuse — "tell me if not
+found" is an instruction about what to say, not permission to go and look.
 
 A claim is kept only if its url appears in the search results the provider
 returned. If nothing came back to check against, the claim is dropped — a url the
@@ -491,7 +522,7 @@ report the parent as changed with no isolation failure behind it.
 
 ## Tests
 
-    pytest -q                                   453 tests, no network, no side files
+    pytest -q                                   496 tests, no network, no side files
     docker compose exec app pytest -q           the same suite inside the image
 
 The suite is hermetic: `tests/conftest.py` swaps the enrichment index and its
@@ -513,6 +544,9 @@ no fetch tool runs on a no-fetch turn.
 `tests/test_delegation_isolation.py` is adversarial: every secret is a canary
 string, the child is asked outright to reveal the parent, and the assertions read
 what was actually sent to the child's model rather than what its context holds.
+`tests/test_fetch_on_miss_and_advisory_discovery.py` pins two live discrepancies
+by the prompts that found them: a fetch-permitting instruction read as a refusal,
+and an advisory domain with no provider to search.
 
 Live checks are gated one by one:
 
