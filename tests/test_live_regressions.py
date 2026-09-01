@@ -4,6 +4,8 @@ The one thing they share: something was filled in where nothing had been
 established — an age, a room count, a date, a set of cards from a previous turn,
 a provider's stack trace. Each check below is about refusing to supply it.
 """
+from datetime import date, timedelta
+
 import pytest
 
 import web_tools
@@ -18,6 +20,15 @@ from runtime import (
 from web_enrich import Cache, Claim, Enricher, Enrichment, Source
 
 ORG = "9f04d2c0-afe2-42c7-a7b2-4f5bcd2b99f2"
+
+# A forecast is only offered as an answer while its day is still ahead — that is
+# what _is_past_forecast is for. So a stored forecast pinned to a fixed date
+# stops testing retrieval the morning that date passes and starts testing the
+# expiry rule instead. Derived from today, and the prose below is derived from
+# the same value so the answer and the claim cannot drift apart.
+FORECAST_DAY = date.today() + timedelta(days=2)
+DAY_ISO = FORECAST_DAY.isoformat()
+DAY_TEXT = f"{FORECAST_DAY.day} {FORECAST_DAY:%B %Y}"
 
 
 class Scripted:
@@ -187,7 +198,7 @@ def stored_weather(monkeypatch):
                             entity_type="city", entity_ref="Riyadh")
     source = Source(url="https://api.open-meteo.com/v1/forecast?x=1",
                     title="Open-Meteo forecast", tier="other")
-    enrichment.claims = [Claim(domain="weather", field_name="forecast_2026-09-11",
+    enrichment.claims = [Claim(domain="weather", field_name=f"forecast_{DAY_ISO}",
                                value="28.4–40.4°C, 0 mm rain", sources=[source])]
     index.add(enrichment)
     monkeypatch.setattr(web_tools, "_index", index)
@@ -216,11 +227,11 @@ async def test_a_weather_turn_after_a_hotel_search_carries_no_hotel_cards(
         LLMResponse(content="Two options; Alpha is the cheaper.")), max_iterations=4)
     assert first.blocks is not None and len(first.blocks) == 2
 
-    second = await agent.run(ctx, "What is the weather there on 11 September 2026?",
+    second = await agent.run(ctx, f"What is the weather there on {DAY_TEXT}?",
                              Scripted(
         LLMResponse(tool_calls=[call("search_enrichment",
-                                     question="weather in Riyadh on 11 September 2026")]),
-        LLMResponse(content="On 11 Sep 2026: 28.4–40.4°C, 0 mm rain.")),
+                                     question=f"weather in Riyadh on {DAY_TEXT}")]),
+        LLMResponse(content=f"On {DAY_TEXT}: 28.4–40.4°C, 0 mm rain.")),
                              max_iterations=4)
 
     assert second.blocks is None, "hotel cards leaked into a weather turn"

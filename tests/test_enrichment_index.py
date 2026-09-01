@@ -1,5 +1,5 @@
 """Free-text search across what enrichment already fetched."""
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -191,11 +191,20 @@ async def test_the_tool_rejects_an_unknown_entity_type(monkeypatch):
 
 # ---- questions phrased normally, not in the words we stored ----
 
+# A forecast is only offered as an answer while the day is still ahead, which is
+# the point of _is_past_forecast. A fixture that hardcodes the date therefore
+# stops testing retrieval the morning that date passes, and starts asserting the
+# expiry rule instead — these five went red on 2 September 2026 for exactly that
+# reason, having passed the day before. Relative to today, they keep testing what
+# they were written to test.
+TOMORROW = (date.today() + timedelta(days=1)).isoformat()
+
+
 def _weather_index():
     index = EnrichmentIndex(SqliteVectorStore())
     index.add(Enrichment(subject="Jeddah", domain="weather", entity_type="city",
                          entity_ref="Jeddah",
-                         claims=[claim("forecast_2026-09-01", "29.2–34.5°C, 0 mm rain",
+                         claims=[claim(f"forecast_{TOMORROW}", "29.2–34.5°C, 0 mm rain",
                                        url="https://api.open-meteo.com/x", domain="weather")]))
     index.add(Enrichment(subject="Carawan Hotel, Jeddah", domain="facilities",
                          entity_type="hotel", entity_ref="Carawan Hotel",
@@ -269,7 +278,7 @@ def _jeddah_weather():
     index = EnrichmentIndex(SqliteVectorStore())
     index.add(Enrichment(subject="Jeddah", domain="weather", entity_type="city",
                          entity_ref="Jeddah",
-                         claims=[claim("forecast_2026-09-11", "29.1–35°C, 0 mm rain",
+                         claims=[claim(f"forecast_{TOMORROW}", "29.1–35°C, 0 mm rain",
                                        url="https://api.open-meteo.com/x", domain="weather")]))
     return index
 

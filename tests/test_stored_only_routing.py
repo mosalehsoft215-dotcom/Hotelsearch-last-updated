@@ -5,6 +5,8 @@ stored, which is exactly what "use stored enrichment only" asks for. Everything
 else is refused before it runs, so the refusal is a property of the tool calls
 the run actually made, not of what the model was asked to do.
 """
+from datetime import date, timedelta
+
 import pytest
 
 import web_tools
@@ -18,10 +20,17 @@ from web_enrich import Cache, Claim, Enricher, Enrichment, Source
 
 ORG = "9f04d2c0-afe2-42c7-a7b2-4f5bcd2b99f2"
 
+# The stored forecast has to stay ahead of today or _is_past_forecast drops it
+# and these stop testing routing. The prose below is built from the same value,
+# so the claim and the sentences about it cannot drift apart.
+FORECAST_DAY = date.today() + timedelta(days=2)
+DAY_ISO = FORECAST_DAY.isoformat()
+DAY_TEXT = f"{FORECAST_DAY.day} {FORECAST_DAY:%B %Y}"
+
 PHRASES = [
-    "For Riyadh, using stored enrichment only, what is the weather on 4 September 2026?",
-    "What is the weather in Riyadh on 4 September 2026? Do not fetch.",
-    "Weather in Riyadh 4 September 2026 — do not use fresh data.",
+    f"For Riyadh, using stored enrichment only, what is the weather on {DAY_TEXT}?",
+    f"What is the weather in Riyadh on {DAY_TEXT}? Do not fetch.",
+    f"Weather in Riyadh {DAY_TEXT} — do not use fresh data.",
     "Use existing enrichment only: what is the weather in Riyadh?",
     "Tell me about Riyadh without fetching anything new.",
     "Use only the stored enrichment for Riyadh.",
@@ -67,7 +76,7 @@ def stored_index(monkeypatch):
     enrichment.claims = [
         Claim(domain="weather", field_name="place", value="Riyadh, Saudi Arabia",
               sources=[source]),
-        Claim(domain="weather", field_name="forecast_2026-09-04",
+        Claim(domain="weather", field_name=f"forecast_{DAY_ISO}",
               value="28.4–40.4°C, 0 mm rain", sources=[source]),
     ]
     index.add(enrichment)
@@ -109,12 +118,12 @@ async def test_no_enrichment_fetch_tool_runs_in_any_no_fetch_case(message, store
     ctx = AgentContext(org_id=ORG)
     llm = Scripted(
         LLMResponse(tool_calls=[call("enrich_destination", city="Riyadh",
-                                     checkIn="2026-09-04", checkOut="2026-09-05")]),
+                                     checkIn=DAY_ISO)]),
         # What the agent actually asks the index — its own words, carrying the
         # subject and the date, not the user's phrasing verbatim.
         LLMResponse(tool_calls=[call("search_enrichment",
-                                     question="weather in Riyadh on 4 September 2026")]),
-        LLMResponse(content="Riyadh on 4 September 2026: 28.4–40.4°C, 0 mm rain, "
+                                     question=f"weather in Riyadh on {DAY_TEXT}")]),
+        LLMResponse(content=f"Riyadh on {DAY_TEXT}: 28.4–40.4°C, 0 mm rain, "
                             "from stored enrichment."),
     )
     result = await agent.run(ctx, message, llm, max_iterations=4)
@@ -173,7 +182,7 @@ async def test_known_entity_unsupported_field_stays_on_search_enrichment(stored_
     agent = HotelSearchAgent()
     ctx = AgentContext(org_id=ORG)
     message = ("Using stored enrichment only, what is the air quality index in "
-               "Riyadh on 4 September 2026?")
+               f"Riyadh on {DAY_TEXT}?")
     llm = Scripted(
         LLMResponse(tool_calls=[call("search_enrichment", question=message)]),
         LLMResponse(tool_calls=[call("enrich_destination", city="Riyadh")]),
@@ -215,7 +224,7 @@ async def test_a_date_the_index_does_not_hold_stays_on_search_enrichment(stored_
         LLMResponse(tool_calls=[call("search_enrichment", question=message)]),
         LLMResponse(tool_calls=[call("enrich_destination", city="Riyadh",
                                      checkIn="2026-12-19")]),
-        LLMResponse(content="Stored enrichment holds 4 September 2026 for Riyadh. "
+        LLMResponse(content=f"Stored enrichment holds {DAY_TEXT} for Riyadh. "
                             "19 December 2026 is not available in stored enrichment."),
     )
     result = await agent.run(ctx, message, llm, max_iterations=4)
