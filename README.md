@@ -27,13 +27,16 @@ prompting.
       hotel_search_agent.py
       ops_triage_agent.py
     api.py                   web server: /chat, /memory, /enrichment, /delegate, /health
+    blocks.py                the structured display channel: block models, and the
+                             builders that derive them from tool payloads
     chat_ui.html             two-agent console + memory, enrichment and delegation panels
+    chat_render.js           one message: markdown answer, then structured blocks
     login.py                 loginRihla -> JWT (+ decode user id)
     healthcheck.py           connection, admin-secret access, JWT login
     check_room_options.py    static data + priced options for one hotel, no agent involved
     demo_memory.py           four durable-memory scenes, no infrastructure needed
     scripts/introspect.py    read the live GraphQL schema
-    tests/                   496 hermetic tests + gated live checks
+    tests/                   548 hermetic tests + 23 renderer tests (node)
 
 ## Run
 
@@ -157,6 +160,68 @@ field`:
     python scripts/introspect.py --input HotelCriteriaSearchInput
     python scripts/introspect.py --query getSearch
     python scripts/introspect.py --dump          # scripts/schema_full.json
+
+## What a message looks like
+
+An answer is markdown for a person to read. Everything the page needs to lay out
+a card comes separately, in `blocks`:
+
+    {"output": "**Two options.** Alpha is the cheaper of the two.",
+     "blocks": [{"type": "hotel_option", "hotel_name": "Alpha", ...}]}
+
+Both fields are needed and neither substitutes for the other. Nothing parses
+JSON back out of the prose, no page regex-matches a table out of a sentence to
+rebuild a card, and the model is never asked to write JSON into text somebody is
+about to read.
+
+`blocks` is additive and absent by default. A turn with nothing structured
+serialises exactly as it did before the field existed — same keys, same names —
+so a caller reading only `output` cannot tell this feature shipped. Four types,
+deliberately, and no generic component schema: `hotel_option`, `flight_option`,
+`booking_summary`, `table`.
+
+Blocks are built in `blocks_from_tool_calls` from the payloads the tools actually
+returned, not from the model's summary of them. A card therefore cannot describe
+a hotel no search returned. Emitting them is opt-in per agent through
+`build_blocks`, whose default is None: a greeting, a weather answer, an advisory
+or a clarifying question has no structured data, so it gets none rather than
+having some invented because the schema exists. `flight_option` is defined and
+rendered but nothing emits it — this repo has no flight tools; `flights` appears
+in `GRANTED_MODULES` as a permission name only.
+
+The models use `extra="forbid"`, which is the point of the schema rather than a
+detail. A builder that grows a hotel code, an option reference or a session id
+fails validation instead of putting an internal identifier on screen. An unknown
+block type, or one with a malformed field, is dropped and logged: a display
+channel must not be able to fail a turn that already has a good answer.
+
+### Rendering
+
+`chat_render.js` is the whole renderer, served beside the page — there is no
+bundler and no build step. Its markdown grammar is imported from the
+yarvel-ai-assistant frontend's `services/markdown.js`: the same feature set
+(bold, italic, headings, ordered and unordered lists, GFM tables, inline and
+fenced code, blockquotes, links, hr) and the same link-scheme allowlist.
+
+One deliberate change on the way in. That version builds an HTML string and
+hands it to `dangerouslySetInnerHTML`, escaping the source first. This one builds
+DOM nodes and never assembles markup from model output at all, because
+`chat_ui.html` states the rule twice: build nodes, never `innerHTML`. Model text
+only ever reaches `createTextNode`, so a tag in an answer stays text by
+construction and there is no sanitiser to trust. `javascript:`, `data:` and
+`vbscript:` urls lose the link and keep the text; real links get
+`rel="noopener noreferrer"`.
+
+Order is fixed: markdown answer, then blocks, then — when the turn used
+enrichment — where the claims came from and how fresh they are, read off the
+metadata the tool results already carried. Nothing is fetched for that line and
+retrieval is untouched.
+
+Its tests run on node's built-in runner and are bridged into pytest, so one
+command still covers both:
+
+    node --test tests/chat_render.test.js       23 tests
+    pytest -q                                  runs the same suite as one case
 
 ## Durable memory
 
@@ -522,7 +587,7 @@ report the parent as changed with no isolation failure behind it.
 
 ## Tests
 
-    pytest -q                                   496 tests, no network, no side files
+    pytest -q                                   548 tests, no network, no side files
     docker compose exec app pytest -q           the same suite inside the image
 
 The suite is hermetic: `tests/conftest.py` swaps the enrichment index and its
@@ -547,6 +612,14 @@ what was actually sent to the child's model rather than what its context holds.
 `tests/test_fetch_on_miss_and_advisory_discovery.py` pins two live discrepancies
 by the prompts that found them: a fetch-permitting instruction read as a refusal,
 and an advisory domain with no provider to search.
+`tests/test_blocks.py` covers the block models, what the builders derive from a
+supplier payload, and that no internal identifier can reach a card.
+`tests/test_blocks_api.py` drives the real `/chat` path and checks the wire: cards
+beside the answer, and a prose turn whose response shape is byte-for-byte what it
+was.
+`tests/chat_render.test.js` covers the renderer against a minimal DOM shim —
+markdown, each card, unknown block types, null optional fields, and raw HTML
+never becoming HTML.
 
 Live checks are gated one by one:
 

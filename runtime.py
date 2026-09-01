@@ -733,11 +733,18 @@ class Handover:
     tools_used: list[str]
     passed: bool
     issues: list[str] = field(default_factory=list)
+    # Travels up with the answer, so a delegated search can hand back cards as
+    # well as prose. Still not the payloads — a block is a display shape.
+    blocks: list[Any] | None = None
 
     def to_model(self) -> dict[str, Any]:
-        return {"agent": self.agent, "answer": self.answer,
-                "tools_used": self.tools_used, "verified": self.passed,
-                "issues": self.issues}
+        model: dict[str, Any] = {"agent": self.agent, "answer": self.answer,
+                                 "tools_used": self.tools_used, "verified": self.passed,
+                                 "issues": self.issues}
+        if self.blocks:
+            from blocks import blocks_to_model
+            model["blocks"] = blocks_to_model(self.blocks)
+        return model
 
 
 async def delegate(agent: "AgentBase", brief: str, llm, parent: AgentContext,
@@ -753,7 +760,8 @@ async def delegate(agent: "AgentBase", brief: str, llm, parent: AgentContext,
     return Handover(agent=agent.get_role(), answer=result.output,
                     tools_used=[c.name for c in child.tool_calls],
                     passed=result.verification.passed,
-                    issues=list(result.verification.issues))
+                    issues=list(result.verification.issues),
+                    blocks=result.blocks)
 
 
 @dataclass
@@ -762,6 +770,11 @@ class AgentRunResult:
     verification: VerificationResult
     context: AgentContext
     messages: list[dict[str, Any]]
+    # Structured display data for the same turn, when the tools returned any.
+    # Additive and optional: `output` is unchanged and every existing caller
+    # that reads only it keeps working. None, not [], so a turn with nothing
+    # structured serialises exactly as it did before this field existed.
+    blocks: list[Any] | None = None
 
 
 # How much transcript a later turn carries, not counting the system prompt.
@@ -826,6 +839,16 @@ class AgentBase(ABC):
 
     def on_run_start(self, ctx: AgentContext) -> None:
         """Called once at the start of a run. Default: nothing."""
+
+    def build_blocks(self, ctx: AgentContext) -> list[Any] | None:
+        """Structured display data for this turn, or None.
+
+        Opt-in: the default is None, so an agent that has nothing tabular to show
+        keeps returning prose exactly as it did. Overriding this is the only way
+        an agent emits blocks — the model is never asked to produce them, so it
+        cannot invent a card for a hotel no tool returned.
+        """
+        return None
 
     def on_run_end(self, ctx: AgentContext, output: str) -> None:
         """Called once after the loop, before verify. Default: nothing."""
@@ -949,4 +972,13 @@ class AgentBase(ABC):
             messages.append({"role": "assistant", "content": output})
         self.on_run_end(ctx, output)
         verification = await self.verify(ctx)
-        return AgentRunResult(output=output, verification=verification, context=ctx, messages=messages)
+        # Built after verification, from the tool payloads on the context. A
+        # failure here must never cost a turn its answer: the prose is the
+        # contract, and the cards are an addition to it.
+        try:
+            blocks = self.build_blocks(ctx)
+        except Exception:
+            logger.exception("building display blocks failed; answering without them")
+            blocks = None
+        return AgentRunResult(output=output, verification=verification, context=ctx,
+                              messages=messages, blocks=blocks)

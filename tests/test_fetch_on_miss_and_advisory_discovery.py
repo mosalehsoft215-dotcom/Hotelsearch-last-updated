@@ -384,3 +384,147 @@ def test_permission_does_not_over_trigger_on_an_incidental_clause(message):
     not permission to go and fetch. Loosening the detector must not have made it
     unable to refuse."""
     assert is_stored_only(message) is True
+
+
+# ---- the Content API is the primary path, and degrades rather than going quiet ----
+
+@pytest.mark.asyncio
+async def test_the_content_api_json_is_the_primary_path(monkeypatch):
+    """Requirement 16. The provider reads the structured payload, not a scraped
+    page: alert_status, public_updated_at and the parts all come from JSON."""
+    provider = GovUkAdvisory()
+    asked = []
+
+    async def canned(url, params=None):
+        asked.append(url)
+        class R:
+            status_code = 200
+            @staticmethod
+            def json():
+                return {"title": "Saudi Arabia travel advice",
+                        "public_updated_at": "2026-07-25T09:00:00+01:00",
+                        "details": {
+                            "alert_status": ["avoid_all_but_essential_travel_to_parts",
+                                             "avoid_all_travel_to_parts"],
+                            "parts": [
+                                {"slug": "entry-requirements", "body": "<p>Visa needed.</p>"},
+                                {"slug": "warnings-and-insurance",
+                                 "body": "<h2>Warnings</h2><p>Insurance may be void.</p>"}]}}
+        return R()
+
+    monkeypatch.setattr(provider._client, "get", canned)
+    claims = await provider.fetch("Riyadh", "advisory", {"country_slug": "saudi-arabia"})
+    by_field = {c.field_name: c.value for c in claims}
+
+    assert asked == ["https://www.gov.uk/api/content/foreign-travel-advice/saudi-arabia"]
+    assert by_field["advisory_level"] == "avoid_all_travel_to_parts"   # worst wins
+    assert by_field["advisory_updated"] == "2026-07-25"
+    assert "avoid_all_but_essential_travel_to_parts" in by_field["regions_flagged"]
+    # The advice section is preferred over the entry-requirements one.
+    assert "Insurance may be void." in by_field["guidance"]
+    assert "Visa needed" not in by_field["guidance"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("details,expected", [
+    # the advice section is missing, another part carries text
+    ({"alert_status": [], "parts": [{"slug": "health", "body": "<p>Take care.</p>"}]},
+     "Take care."),
+    # no usable parts at all: the page-level changelog is the last resort
+    ({"alert_status": [], "parts": [], "change_description": "Updated safety advice."},
+     "Updated safety advice."),
+    # a part with an empty body must not win over one that has text
+    ({"alert_status": [], "parts": [{"slug": "warnings-and-insurance", "body": ""},
+                                    {"slug": "safety-and-security", "body": "<p>Be alert.</p>"}]},
+     "Be alert."),
+])
+async def test_guidance_degrades_rather_than_disappearing(monkeypatch, details, expected):
+    """Requirement 17. Where the Content API does not carry the expected section,
+    the next-best field in the same payload is used instead of returning an
+    advisory with no advice on it."""
+    provider = GovUkAdvisory()
+
+    async def canned(url, params=None):
+        class R:
+            status_code = 200
+            @staticmethod
+            def json():
+                return {"title": "Somewhere travel advice",
+                        "public_updated_at": "2026-07-25T09:00:00+01:00",
+                        "details": details}
+        return R()
+
+    monkeypatch.setattr(provider._client, "get", canned)
+    claims = await provider.fetch("Somewhere", "advisory", {"country_slug": "somewhere"})
+    guidance = {c.field_name: c.value for c in claims}.get("guidance")
+    assert guidance is not None and expected in guidance
+
+
+@pytest.mark.asyncio
+async def test_a_payload_with_nothing_to_say_still_yields_the_level(monkeypatch):
+    """No guidance anywhere is a thin answer, not a broken one — the level and
+    the date are still real, government-sourced claims."""
+    provider = GovUkAdvisory()
+
+    async def canned(url, params=None):
+        class R:
+            status_code = 200
+            @staticmethod
+            def json():
+                return {"public_updated_at": "2026-07-25T09:00:00+01:00",
+                        "details": {"alert_status": [], "parts": []}}
+        return R()
+
+    monkeypatch.setattr(provider._client, "get", canned)
+    claims = await provider.fetch("Somewhere", "advisory", {"country_slug": "somewhere"})
+    fields = {c.field_name for c in claims}
+    assert "advisory_level" in fields and "guidance" not in fields
+    assert all(c.sources[0].url.startswith("https://www.gov.uk/") for c in claims)
+
+
+@pytest.mark.asyncio
+async def test_the_government_source_rule_is_unchanged_by_the_fallbacks(monkeypatch):
+    """Requirement 18. However the guidance text was recovered, the authority
+    still comes from the host, and only from the host."""
+    from web_enrich import Cache, Enricher
+
+    provider = GovUkAdvisory()
+
+    async def canned(url, params=None):
+        class R:
+            status_code = 200
+            @staticmethod
+            def json():
+                return {"public_updated_at": "2026-07-25T09:00:00+01:00",
+                        "details": {"alert_status": [], "parts": [],
+                                    "change_description": "Updated advice."}}
+        return R()
+
+    monkeypatch.setattr(provider._client, "get", canned)
+    model = (await Enricher([provider], Cache()).enrich(
+        "Somewhere", "advisory", {"country_slug": "somewhere"},
+        entity_type="city", entity_ref="Somewhere")).to_model()
+
+    assert model["checks"]["official_advisory_verified"] is True
+    assert all(e["authority"] == "government"
+               for entries in model["findings"].values() for e in entries)
+    # And a non-government host is still refused, with the identical payload.
+    assert is_government_source("https://www.reuters.com/x") is False
+
+
+@pytest.mark.asyncio
+async def test_a_stored_only_turn_still_never_fetches_an_advisory(empty_index):
+    """Requirement 19. The advisory work must not have opened a fetch path on a
+    turn the user restricted."""
+    agent = HotelSearchAgent()
+    ctx = AgentContext(org_id=ORG)
+    llm = Scripted(
+        LLMResponse(tool_calls=[call("enrich_destination", city="Muscat")]),
+        LLMResponse(content="Not available in stored enrichment."),
+    )
+    await agent.run(ctx, "Using stored enrichment only, is there an advisory for Muscat?",
+                    llm, max_iterations=4)
+
+    assert ctx.stored_only is True
+    assert ctx.tool_calls == []
+    assert {c.name for c in ctx.tool_calls} & ENRICHMENT_FETCH_TOOLS == set()

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
+from fastapi import Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -30,6 +31,7 @@ from agents.ops_triage_agent import OpsTriageAgent
 from config import get_settings
 from memory import build_memory
 from runtime import AgentContext, build_llm, delegate, trim_history
+from blocks import blocks_to_model, sources_from_tool_calls
 from web_tools import index_stats, search_enrichment
 
 logger = logging.getLogger("tripon.agents.api")
@@ -39,6 +41,7 @@ _settings = get_settings()
 _AGENTS = {"hotel": HotelSearchAgent(), "triage": OpsTriageAgent()}
 _MEMORY = build_memory(_settings)   # durable across sessions and page reloads
 _CHAT_HTML = (Path(__file__).parent / "chat_ui.html").read_text(encoding="utf-8")
+_CHAT_RENDER_JS = (Path(__file__).parent / "chat_render.js").read_text(encoding="utf-8")
 
 
 @dataclass
@@ -121,6 +124,13 @@ async def index() -> str:
     return _CHAT_HTML
 
 
+@app.get("/chat_render.js")
+async def chat_render_js() -> Response:
+    """The message renderer, served beside the page. A separate file so it can be
+    tested on its own; the page has no bundler and needs no build step."""
+    return Response(_CHAT_RENDER_JS, media_type="application/javascript")
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict[str, Any]:
     session_id = req.session_id or uuid.uuid4().hex
@@ -182,6 +192,12 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
             "session_id": session_id,
             "agent": agent_key,
             "output": result.output,
+            # Structured display data for this turn. Omitted entirely when the
+            # turn has none, so a client that only reads "output" sees exactly
+            # the response shape it saw before this field existed.
+            **({"blocks": blocks_to_model(result.blocks)} if result.blocks else {}),
+            **({"sources": _sources} if (_sources := sources_from_tool_calls(
+                session.ctx.tool_calls[before:])) else {}),
             "verification": {"passed": result.verification.passed,
                              "issues": result.verification.issues},
             "tools_called": [c.name for c in session.ctx.tool_calls[before:]],

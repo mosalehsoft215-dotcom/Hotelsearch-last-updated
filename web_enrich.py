@@ -830,9 +830,25 @@ class GovUkAdvisory:
             claims.append(Claim(domain=domain, field_name="regions_flagged",
                                 provider=self.name, value=", ".join(alert_status),
                                 sources=[source]))
-        advice = next((p for p in (details.get("parts") or [])
-                       if p.get("slug") == self._ADVICE_PART), None)
-        body = neutralise(self._plain_text((advice or {}).get("body", "")), limit=600)
+        # The structured payload is the primary source for the advice text, and
+        # the warnings section is where it lives. Three fallbacks, in order, so a
+        # payload that is shaped differently still yields guidance instead of
+        # silently dropping the one field a reader actually wants:
+        #   1. the warnings-and-insurance part,
+        #   2. any other part that has a body,
+        #   3. the page-level description or changelog blurb.
+        parts = [p for p in (details.get("parts") or []) if isinstance(p, dict)]
+        candidates = [p for p in parts if p.get("slug") == self._ADVICE_PART]
+        candidates += [p for p in parts if p.get("slug") != self._ADVICE_PART]
+        body = ""
+        for part in candidates:
+            body = neutralise(self._plain_text(part.get("body") or ""), limit=600)
+            if body:
+                break
+        if not body:
+            body = neutralise(self._plain_text(
+                payload.get("description") or details.get("change_description") or ""),
+                limit=600)
         if body:
             claims.append(Claim(domain=domain, field_name="guidance", provider=self.name,
                                 value=body, sources=[source]))

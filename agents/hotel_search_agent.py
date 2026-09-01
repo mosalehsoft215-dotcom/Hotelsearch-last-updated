@@ -9,6 +9,7 @@ import re
 from datetime import date
 
 from config import get_settings
+from blocks import blocks_from_tool_calls
 from web_enrich import MONEY, is_government_source
 from runtime import (
     ENRICHMENT_FETCH_TOOLS, AgentBase, AgentContext, AgentRunResult, ToolCall,
@@ -418,7 +419,13 @@ Without a transactionId, do not attempt a lock and do not describe one as pendin
 
 Once a room's price is confirmed, keep in memory: {MEM_SESSION_ID} (the search uuid), {MEM_OPTION_REF} (the OptionRefId), {MEM_CONFIRMED_PRICE} (the confirmed price), and {MEM_PARAMS} (city, dates, guests).
 
-If nothing is available, say so plainly and suggest different dates or a nearby area. Never invent hotels or prices.{known}
+If nothing is available, say so plainly and suggest different dates or a nearby area. Never invent hotels or prices.
+
+Write the answer as markdown for a person to read: short lead line first, then bullets for one or two records and a table for three or more. Bold for emphasis, dates as "15 Aug 2026", amounts with their currency.
+
+No raw JSON in the answer. Structured display data reaches the page through a separate channel, built from what the tools returned — so when you have listed hotels or confirmed a rate, the reader is already seeing a card for each one underneath your text. Summarise in prose: say which option is cheapest, which is refundable, what the trade-off is. Do not restate every field of every card in a long table as well, unless a comparison genuinely needs one.
+
+Never put internal field names, tool names, session or search ids, supplier option references, or any other implementation detail in the answer. That rule is unchanged and the display channel is not an exception to it — it carries the same customer-facing facts, nothing more.{known}
 For anything the supplier feed does not answer, use the enrichment tools. enrich_hotel_info covers one hotel — reputation, location, facilities, and risks such as renovation or closure. enrich_destination covers the trip itself — weather for the dates, current travel advice, recent news. enrich_company_facts covers a chain, brand owner or supplier — legal name, parent or owner, headquarters, year founded, official website, chief executive. enrich_agency_facts covers a travel agency — registered or trading name, country, head office, official website, published contact details, accreditation or licence.
 
 Those last two carry a fixed set of fields and nothing else. Each result lists what it found and, separately, what it could not: `not_verified` is a field no authoritative source stood behind, `missing` is one nothing carried. Report both as not verified. Do not fill either from your own knowledge — a chief executive, a licence number or a phone number that no source returned is a guess, and here it is a guess a customer might act on. If the user asks for a field outside the list, say it is not something enrichment carries.
@@ -463,6 +470,16 @@ Apply what is already known above without being asked again, and say which prefe
             price = result.get("price")
             if price is not None and not result.get("error"):
                 ctx.remember(MEM_CONFIRMED_PRICE, price)
+
+    def build_blocks(self, ctx: AgentContext):
+        """Cards for the hotels and quotes this turn actually returned.
+
+        Derived from the supplier payloads on the context, never from the answer
+        text, so a card cannot describe a hotel no search returned. A turn that
+        called no priced tool — a weather question, an advisory, a clarifying
+        question — produces None and renders exactly as it did before.
+        """
+        return blocks_from_tool_calls(ctx.tool_calls)
 
     def on_run_end(self, ctx: AgentContext, output: str) -> None:
         # verify() only ever inspected tool calls. The faults that matter most —
